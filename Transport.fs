@@ -14,6 +14,7 @@ type TransportState = {
     Keys: DerivedKeys option
     ClientToServerIV: byte[] option
     ServerToClientIV: byte[] option
+    Role: ConnectionRole
 }
 
 module TransportState =
@@ -26,9 +27,47 @@ module TransportState =
         Keys = None
         ClientToServerIV = None
         ServerToClientIV = None
+        Role = Server
+    }
+
+    let createClient clientVersion = {
+        ClientVersion = Some clientVersion
+        ServerVersion = ""
+        EncryptionEnabled = false
+        ClientToServerSequence = 0u
+        ServerToClientSequence = 0u
+        Keys = None
+        ClientToServerIV = None
+        ServerToClientIV = None
+        Role = Client
     }
 
 module Transport =
+
+    // Role-aware key selection: which keys to use for reading vs writing
+    // Server reads client-to-server, writes server-to-client
+    // Client reads server-to-client, writes client-to-server
+    let private getReadKeys (state: TransportState) =
+        match state.Role, state.Keys with
+        | Server, Some keys -> Some (state.ClientToServerSequence, state.ClientToServerIV, keys.ClientToServerEncryptionKey, keys.ClientToServerMacKey)
+        | Client, Some keys -> Some (state.ServerToClientSequence, state.ServerToClientIV, keys.ServerToClientEncryptionKey, keys.ServerToClientMacKey)
+        | _, _ -> None
+
+    let private updateReadState (state: TransportState) (newSeq: uint32) (newIv: byte[] option) =
+        match state.Role with
+        | Server -> { state with ClientToServerSequence = newSeq; ClientToServerIV = newIv |> Option.orElse state.ClientToServerIV }
+        | Client -> { state with ServerToClientSequence = newSeq; ServerToClientIV = newIv |> Option.orElse state.ServerToClientIV }
+
+    let private getWriteKeys (state: TransportState) =
+        match state.Role, state.Keys with
+        | Server, Some keys -> Some (state.ServerToClientSequence, state.ServerToClientIV, keys.ServerToClientEncryptionKey, keys.ServerToClientMacKey)
+        | Client, Some keys -> Some (state.ClientToServerSequence, state.ClientToServerIV, keys.ClientToServerEncryptionKey, keys.ClientToServerMacKey)
+        | _, _ -> None
+
+    let private updateWriteState (state: TransportState) (newSeq: uint32) (newIv: byte[] option) =
+        match state.Role with
+        | Server -> { state with ServerToClientSequence = newSeq; ServerToClientIV = newIv |> Option.orElse state.ServerToClientIV }
+        | Client -> { state with ClientToServerSequence = newSeq; ClientToServerIV = newIv |> Option.orElse state.ClientToServerIV }
 
     let private readLineAsync (stream: NetworkStream) = async {
         let buffer = ResizeArray<byte>()
@@ -56,17 +95,11 @@ module Transport =
         return! readLoop ()
     }
 
-    let exchangeVersions (stream: NetworkStream) (serverVersion: string) = async {
-        // Send server version
-        let versionLine = serverVersion + "\r\n"
-        let versionBytes = Encoding.ASCII.GetBytes(versionLine)
-        do! stream.WriteAsync(versionBytes, 0, versionBytes.Length) |> Async.AwaitTask
-
-        // Read client version (skip lines not starting with SSH-)
-        let rec readClientVersion () = async {
+    let private readSshVersion (stream: NetworkStream) = async {
+        let rec readVersion () = async {
             let! lineOpt = readLineAsync stream
             match lineOpt with
-            | None -> return Error (ProtocolError "Failed to read client version")
+            | None -> return Error (ProtocolError "Failed to read SSH version")
             | Some line ->
                 if line.StartsWith("SSH-") then
                     if line.StartsWith("SSH-2.0-") || line.StartsWith("SSH-1.99-") then
@@ -74,11 +107,31 @@ module Transport =
                     else
                         return Error (ProtocolError $"Unsupported SSH version: {line}")
                 else
-                    // Skip non-SSH lines (allowed before version)
-                    return! readClientVersion ()
+                    return! readVersion ()
         }
+        return! readVersion ()
+    }
 
-        return! readClientVersion ()
+    let private sendVersion (stream: NetworkStream) (version: string) = async {
+        let versionLine = version + "\r\n"
+        let versionBytes = Encoding.ASCII.GetBytes(versionLine)
+        do! stream.WriteAsync(versionBytes, 0, versionBytes.Length) |> Async.AwaitTask
+    }
+
+    /// Server-side version exchange: send server version, read client version
+    let exchangeVersions (stream: NetworkStream) (serverVersion: string) = async {
+        do! sendVersion stream serverVersion
+        return! readSshVersion stream
+    }
+
+    /// Client-side version exchange: read server version, send client version
+    let exchangeVersionsAsClient (stream: NetworkStream) (clientVersion: string) = async {
+        let! serverVersionResult = readSshVersion stream
+        match serverVersionResult with
+        | Error e -> return Error e
+        | Ok serverVersion ->
+            do! sendVersion stream clientVersion
+            return Ok serverVersion
     }
 
     let private readExactAsync (stream: NetworkStream) (count: int) = async {
@@ -109,16 +162,19 @@ module Transport =
                     return Error (ProtocolError "Invalid packet structure")
                 else
                     let payload = packetData.[1..payloadLength]
-                    let newState = { state with ClientToServerSequence = state.ClientToServerSequence + 1u }
+                    let readSeq =
+                        match state.Role with
+                        | Server -> state.ClientToServerSequence
+                        | Client -> state.ServerToClientSequence
+                    let newState = updateReadState state (readSeq + 1u) None
                     return Ok (payload, newState)
         else
-            match state.Keys, state.ClientToServerIV with
-            | Some keys, Some iv ->
+            match getReadKeys state with
+            | Some (readSeq, Some iv, encKey, macKey) ->
                 // Encrypted packet
-                // First, read and decrypt the first block to get packet length
                 let blockSize = Constants.BlockSize
                 let! firstBlock = readExactAsync stream blockSize
-                let decryptedFirstBlock = Crypto.aes256CtrDecrypt keys.ClientToServerEncryptionKey iv firstBlock
+                let decryptedFirstBlock = Crypto.aes256CtrDecrypt encKey iv firstBlock
 
                 // Update IV for next block
                 let newIv = Array.copy iv
@@ -134,7 +190,6 @@ module Transport =
                 if packetLength < 1 || packetLength > int Constants.MaxPacketSize then
                     return Error (ProtocolError $"Invalid encrypted packet length: {packetLength}")
                 else
-                    // Calculate remaining bytes to read (including MAC)
                     let totalEncryptedLength = 4 + packetLength
                     let remainingEncrypted = totalEncryptedLength - blockSize
                     let blocksRemaining = (remainingEncrypted + blockSize - 1) / blockSize
@@ -149,10 +204,9 @@ module Transport =
                     for i in 0 .. blocksRemaining - 1 do
                         let blockStart = i * blockSize
                         let block = remainingData.[blockStart..blockStart + blockSize - 1]
-                        let decryptedBlock = Crypto.aes256CtrDecrypt keys.ClientToServerEncryptionKey currentIv block
+                        let decryptedBlock = Crypto.aes256CtrDecrypt encKey currentIv block
                         Array.Copy(decryptedBlock, 0, decryptedRemaining, blockStart, blockSize)
 
-                        // Update IV
                         let mutable c = 1
                         for j = blockSize - 1 downto 0 do
                             if c > 0 then
@@ -160,26 +214,20 @@ module Transport =
                                 currentIv.[j] <- byte (sum &&& 0xFF)
                                 c <- sum >>> 8
 
-                    // Combine decrypted data
                     let fullDecrypted = Array.append decryptedFirstBlock decryptedRemaining
                     let actualPacketData = fullDecrypted.[0..4 + packetLength - 1]
 
                     // Verify MAC
-                    let seqBytes = Packet.writeUint32 state.ClientToServerSequence
+                    let seqBytes = Packet.writeUint32 readSeq
                     let macInput = Array.append seqBytes actualPacketData
-                    let expectedMac = Crypto.hmacSha256 keys.ClientToServerMacKey macInput
 
-                    if not (Crypto.verifyHmacSha256 keys.ClientToServerMacKey macInput mac) then
+                    if not (Crypto.verifyHmacSha256 macKey macInput mac) then
                         return Error (ProtocolError "MAC verification failed")
                     else
                         let paddingLength = int fullDecrypted.[4]
                         let payloadLength = packetLength - paddingLength - 1
                         let payload = fullDecrypted.[5..5 + payloadLength - 1]
-                        let newState = {
-                            state with
-                                ClientToServerSequence = state.ClientToServerSequence + 1u
-                                ClientToServerIV = Some currentIv
-                        }
+                        let newState = updateReadState state (readSeq + 1u) (Some currentIv)
                         return Ok (payload, newState)
             | _ ->
                 return Error (ProtocolError "Encryption enabled but no keys available")
@@ -187,25 +235,25 @@ module Transport =
 
     let writePacket (stream: NetworkStream) (state: TransportState) (payload: byte[]) = async {
         if not state.EncryptionEnabled then
-            // Unencrypted packet - block size is 8 before encryption is enabled
             let packet = Packet.buildPacket payload 8
             do! stream.WriteAsync(packet, 0, packet.Length) |> Async.AwaitTask
-            return Ok { state with ServerToClientSequence = state.ServerToClientSequence + 1u }
+            let writeSeq =
+                match state.Role with
+                | Server -> state.ServerToClientSequence
+                | Client -> state.ClientToServerSequence
+            return Ok (updateWriteState state (writeSeq + 1u) None)
         else
-            match state.Keys, state.ServerToClientIV with
-            | Some keys, Some iv ->
-                // Encrypted packet
+            match getWriteKeys state with
+            | Some (writeSeq, Some iv, encKey, macKey) ->
                 let blockSize = Constants.BlockSize
                 let packet = Packet.buildPacket payload blockSize
 
-                // Compute MAC before encryption (encrypt-then-MAC would be different)
                 // SSH uses encrypt-and-MAC: MAC(seq || unencrypted_packet)
-                let seqBytes = Packet.writeUint32 state.ServerToClientSequence
+                let seqBytes = Packet.writeUint32 writeSeq
                 let macInput = Array.append seqBytes packet
-                let mac = Crypto.hmacSha256 keys.ServerToClientMacKey macInput
+                let mac = Crypto.hmacSha256 macKey macInput
 
-                // Encrypt entire packet at once using CTR mode
-                let encrypted = Crypto.aes256CtrEncrypt keys.ServerToClientEncryptionKey iv packet
+                let encrypted = Crypto.aes256CtrEncrypt encKey iv packet
 
                 // Calculate new IV after encrypting all blocks
                 let numBlocks = (packet.Length + blockSize - 1) / blockSize
@@ -218,15 +266,10 @@ module Transport =
                             newIv.[j] <- byte (sum &&& 0xFF)
                             carry <- sum >>> 8
 
-                // Send encrypted packet + MAC
                 let output = Array.append encrypted mac
                 do! stream.WriteAsync(output, 0, output.Length) |> Async.AwaitTask
 
-                return Ok {
-                    state with
-                        ServerToClientSequence = state.ServerToClientSequence + 1u
-                        ServerToClientIV = Some newIv
-                }
+                return Ok (updateWriteState state (writeSeq + 1u) (Some newIv))
             | _ ->
                 return Error (ProtocolError "Encryption enabled but no keys available")
     }

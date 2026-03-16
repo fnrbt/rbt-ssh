@@ -366,7 +366,50 @@ let runServer () =
 
     Async.RunSynchronously(acceptLoop ())
 
+// Run a client that connects and executes a command
+let runClient (host: string) (port: int) (username: string) (password: string) (command: string) =
+    let config = {
+        ClientConfig.defaults with
+            Username = username
+            HostKeyVerification = AcceptAll
+    }
+    let authConfig: ClientAuth.ClientAuthConfig = {
+        Username = username
+        Methods = [ ClientAuth.PasswordAuth password ]
+    }
+
+    async {
+        printfn "Connecting to %s:%d..." host port
+        let! result = Client.connectAsync host port config authConfig
+        match result with
+        | Error e ->
+            printfn "Connection failed: %A" e
+        | Ok client ->
+            printfn "Connected and authenticated"
+            let! execResult = Client.exec client command
+            match execResult with
+            | Error e ->
+                printfn "Exec failed: %A" e
+            | Ok (exitCode, stdout, stderr) ->
+                let stdoutStr = Encoding.UTF8.GetString(stdout)
+                let stderrStr = Encoding.UTF8.GetString(stderr)
+                if stdoutStr.Length > 0 then
+                    printfn "stdout: %s" stdoutStr
+                if stderrStr.Length > 0 then
+                    eprintfn "stderr: %s" stderrStr
+                printfn "exit code: %d" exitCode
+            do! Client.disconnect client
+    } |> Async.RunSynchronously
+
 [<EntryPoint>]
-let main _args =
-    runServer ()
+let main args =
+    match args |> Array.toList with
+    | "client" :: host :: port :: user :: pass :: command ->
+        let cmd = String.concat " " command
+        runClient host (int port) user pass cmd
+    | _ ->
+        printfn "Usage:"
+        printfn "  Server: dotnet run"
+        printfn "  Client: dotnet run -- client <host> <port> <user> <password> <command...>"
+        runServer ()
     0

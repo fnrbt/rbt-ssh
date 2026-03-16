@@ -275,6 +275,31 @@ type AuthResult =
     | Rejected
     | PartialSuccess of remainingMethods: string list
 
+/// Connection role (determines key direction in transport)
+type ConnectionRole = Server | Client
+
+/// Host key verification policy for client connections
+type HostKeyVerification =
+    | AcceptAll
+    | Fingerprint of expectedFingerprints: string list
+    | Custom of verify: (string -> byte[] -> bool)
+
+/// Client configuration
+type ClientConfig = {
+    ClientVersion: string
+    Username: string
+    ConnectTimeout: TimeSpan
+    HostKeyVerification: HostKeyVerification
+}
+
+module ClientConfig =
+    let defaults = {
+        ClientVersion = "SSH-2.0-FSharpSSH_1.0"
+        Username = ""
+        ConnectTimeout = TimeSpan.FromSeconds(30.0)
+        HostKeyVerification = AcceptAll
+    }
+
 /// SSH error types
 type SshError =
     | ProtocolError of message: string
