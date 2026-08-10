@@ -219,14 +219,23 @@ module Channel =
             return Ok (transportState, manager)
         | Some channel ->
             // Send close back if we haven't already
-            if not channel.IsClosed then
-                let closeMsg = ChannelClose(channel.RemoteChannel)
-                let! _ = Transport.sendMessage stream transportState closeMsg
-                ()
+            let! newTransportState =
+                if not channel.IsClosed then
+                    async {
+                        let closeMsg = ChannelClose(channel.RemoteChannel)
+                        let! sendResult = Transport.sendMessage stream transportState closeMsg
+                        match sendResult with
+                        | Ok state -> return state
+                        | Error _ -> return transportState
+                    }
+                else
+                    async {
+                        return transportState
+                    }
 
             do! callbacks.OnClose channel.LocalChannel
             ChannelManager.removeChannel manager recipientChannel
-            return Ok (transportState, manager)
+            return Ok (newTransportState, manager)
     }
 
     // Handle CHANNEL_WINDOW_ADJUST

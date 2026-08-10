@@ -12,6 +12,7 @@ module Auth =
         MaxAttempts: int
         SessionId: byte[]
         AvailableMethods: string list
+        AuthenticatedPublicKey: (string * byte[]) option
     }
 
     module AuthState =
@@ -22,6 +23,7 @@ module Auth =
             MaxAttempts = maxAttempts
             SessionId = sessionId
             AvailableMethods = ["publickey"; "password"]
+            AuthenticatedPublicKey = None
         }
 
     // Build the data that is signed for public key authentication
@@ -91,7 +93,7 @@ module Auth =
                         match sendResult with
                         | Error e -> return Error e
                         | Ok newTransportState ->
-                            return Ok (newTransportState, newAuthState, true)
+                            return Ok (newTransportState, { newAuthState with AuthenticatedPublicKey = None }, true)
 
                     | Rejected ->
                         let failureMsg = UserAuthFailure(newAuthState.AvailableMethods, false)
@@ -164,7 +166,7 @@ module Auth =
                                     match sendResult with
                                     | Error e -> return Error e
                                     | Ok newTransportState ->
-                                        return Ok (newTransportState, newAuthState, true)
+                                        return Ok (newTransportState, { newAuthState with AuthenticatedPublicKey = Some(algorithmName, publicKeyBlob) }, true)
 
                                 | PartialSuccess remainingMethods ->
                                     let failureMsg = UserAuthFailure(remainingMethods, true)

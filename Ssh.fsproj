@@ -15,6 +15,7 @@
     <Compile Include="Auth.fs" />
     <Compile Include="Channel.fs" />
     <Compile Include="Session.fs" />
+    <Compile Include="ExecServer.fs" />
     <Compile Include="Server.fs" />
     <Compile Include="ClientKeyExchange.fs" />
     <Compile Include="ClientAuth.fs" />
