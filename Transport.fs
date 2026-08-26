@@ -1,4 +1,4 @@
-namespace Ssh
+namespace Rbt.Ssh
 
 open System
 open System.IO

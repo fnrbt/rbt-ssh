@@ -4,7 +4,7 @@ open System
 open System.Text
 open System.Net.Sockets
 open System.Collections.Concurrent
-open Ssh
+open Rbt.Ssh
 
 // Rot13 transformation
 let rot13 (s: string) =
