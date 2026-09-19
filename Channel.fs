@@ -3,47 +3,110 @@ namespace Rbt.Ssh
 open System
 open System.Collections.Generic
 open System.Net.Sockets
+open System.Threading
 
 module Channel =
 
     type ChannelManager = {
         Channels: Dictionary<uint32, ChannelState>
         NextChannelId: uint32
+        /// Guards `Channels`. The receive loop mutates channel records while
+        /// an exec writer reads and mutates the same records, so every access
+        /// goes through this lock.
+        Sync: obj
     }
 
     module ChannelManager =
         let create () = {
             Channels = Dictionary<uint32, ChannelState>()
             NextChannelId = 0u
+            Sync = obj ()
         }
 
         let allocateChannel (manager: ChannelManager) channelType remoteChannel remoteWindowSize remoteMaxPacketSize =
-            let localChannel = manager.NextChannelId
-            let channel = ChannelState.create
-                            localChannel
-                            remoteChannel
-                            channelType
-                            Constants.DefaultWindowSize
-                            Constants.DefaultMaxPacketSize
-                            remoteWindowSize
-                            remoteMaxPacketSize
-            manager.Channels.[localChannel] <- channel
-            ({ manager with NextChannelId = localChannel + 1u }, channel)
+            lock manager.Sync (fun () ->
+                let localChannel = manager.NextChannelId
+                let channel = ChannelState.create
+                                localChannel
+                                remoteChannel
+                                channelType
+                                Constants.DefaultWindowSize
+                                Constants.DefaultMaxPacketSize
+                                remoteWindowSize
+                                remoteMaxPacketSize
+                manager.Channels.[localChannel] <- channel
+                ({ manager with NextChannelId = localChannel + 1u }, channel))
 
         let getChannel (manager: ChannelManager) channelId =
-            match manager.Channels.TryGetValue(channelId) with
-            | true, channel -> Some channel
-            | false, _ -> None
+            lock manager.Sync (fun () ->
+                match manager.Channels.TryGetValue(channelId) with
+                | true, channel -> Some channel
+                | false, _ -> None)
 
         let updateChannel (manager: ChannelManager) channelId (update: ChannelState -> ChannelState) =
-            match manager.Channels.TryGetValue(channelId) with
-            | true, channel ->
-                manager.Channels.[channelId] <- update channel
-                true
-            | false, _ -> false
+            lock manager.Sync (fun () ->
+                match manager.Channels.TryGetValue(channelId) with
+                | true, channel ->
+                    manager.Channels.[channelId] <- update channel
+                    true
+                | false, _ -> false)
 
         let removeChannel (manager: ChannelManager) channelId =
-            manager.Channels.Remove(channelId) |> ignore
+            lock manager.Sync (fun () ->
+                match manager.Channels.TryGetValue(channelId) with
+                | true, channel ->
+                    // Release any sender waiting for credit on this channel.
+                    channel.WindowSignal.TrySetResult () |> ignore
+                | false, _ -> ()
+                manager.Channels.Remove(channelId) |> ignore)
+
+    /// Outcome of asking to send `requested` bytes of channel data.
+    type CreditGrant =
+        /// Credit is reserved for these bytes; they may be sent now.
+        | Granted of bytes: byte[]
+        /// The peer window is empty. Await the signal, then ask again. The
+        /// reservation is not taken, so the caller must not send anything.
+        | Waiting of signal: System.Threading.Tasks.TaskCompletionSource<unit>
+
+    /// Reserve up to one packet of outbound credit, or report the signal that
+    /// announces the next CHANNEL_WINDOW_ADJUST. Checking the window and
+    /// capturing the signal happen under one lock hold, so an adjustment that
+    /// lands between the two can never be missed.
+    let acquireOutboundCredit
+        (manager: ChannelManager)
+        (localChannel: uint32)
+        (data: byte[]) =
+        lock manager.Sync (fun () ->
+            match manager.Channels.TryGetValue(localChannel) with
+            | false, _ -> Error (ChannelError $"Unknown channel: {localChannel}")
+            | true, channel ->
+                let packetLimit = min (uint32 data.Length) channel.RemoteMaxPacketSize
+                if channel.RemoteWindowSize = 0u || packetLimit = 0u then
+                    Ok (Waiting channel.WindowSignal)
+                else
+                    let granted = min packetLimit channel.RemoteWindowSize
+                    manager.Channels.[localChannel] <-
+                        { channel with RemoteWindowSize = channel.RemoteWindowSize - granted }
+                    Ok (Granted data.[.. int granted - 1]))
+
+    /// Await an outbound credit signal. Returns an error if the send is
+    /// cancelled while waiting.
+    let waitForCredit
+        (signal: System.Threading.Tasks.TaskCompletionSource<unit>)
+        (ct: CancellationToken) = async {
+        if ct.IsCancellationRequested then
+            return Error (ChannelError "Channel send cancelled")
+        else
+            let! completed =
+                System.Threading.Tasks.Task.WhenAny(
+                    signal.Task,
+                    System.Threading.Tasks.Task.Delay(Timeout.Infinite, ct))
+                |> Async.AwaitTask
+            return
+                if completed.Status = System.Threading.Tasks.TaskStatus.Canceled then
+                    Error (ChannelError "Channel send cancelled")
+                else Ok ()
+    }
 
     // Handle CHANNEL_OPEN request
     let handleChannelOpen
@@ -244,65 +307,20 @@ module Channel =
         (recipientChannel: uint32)
         (bytesToAdd: uint32) =
 
-        match ChannelManager.getChannel manager recipientChannel with
-        | None ->
-            Error (ChannelError $"Unknown channel: {recipientChannel}")
-        | Some _channel ->
-            ChannelManager.updateChannel manager recipientChannel (fun ch ->
-                { ch with RemoteWindowSize = ch.RemoteWindowSize + bytesToAdd }
-            ) |> ignore
-            Ok manager
-
-    // Send data on a channel
-    let sendChannelData
-        (stream: NetworkStream)
-        (transportState: TransportState)
-        (manager: ChannelManager)
-        (localChannel: uint32)
-        (data: byte[]) = async {
-
-        match ChannelManager.getChannel manager localChannel with
-        | None ->
-            return Error (ChannelError $"Unknown channel: {localChannel}")
-        | Some channel ->
-            // Check window size
-            let dataLen = uint32 data.Length
-            if dataLen > channel.RemoteWindowSize then
-                return Error (ChannelError "Remote window size exceeded")
-            elif dataLen > channel.RemoteMaxPacketSize then
-                return Error (ChannelError "Remote max packet size exceeded")
-            else
-                let dataMsg = ChannelData(channel.RemoteChannel, data)
-                let! sendResult = Transport.sendMessage stream transportState dataMsg
-                match sendResult with
-                | Error e -> return Error e
-                | Ok newTransportState ->
-                    ChannelManager.updateChannel manager localChannel (fun ch ->
-                        { ch with RemoteWindowSize = ch.RemoteWindowSize - dataLen }
-                    ) |> ignore
-                    return Ok newTransportState
-    }
-
-    // Send extended data (e.g., stderr) on a channel
-    let sendChannelExtendedData
-        (stream: NetworkStream)
-        (transportState: TransportState)
-        (manager: ChannelManager)
-        (localChannel: uint32)
-        (dataTypeCode: uint32)
-        (data: byte[]) = async {
-
-        match ChannelManager.getChannel manager localChannel with
-        | None ->
-            return Error (ChannelError $"Unknown channel: {localChannel}")
-        | Some channel ->
-            let extDataMsg = ChannelExtendedData(channel.RemoteChannel, dataTypeCode, data)
-            let! sendResult = Transport.sendMessage stream transportState extDataMsg
-            match sendResult with
-            | Error e -> return Error e
-            | Ok newTransportState ->
-                return Ok newTransportState
-    }
+        lock manager.Sync (fun () ->
+            match manager.Channels.TryGetValue(recipientChannel) with
+            | false, _ -> Error (ChannelError $"Unknown channel: {recipientChannel}")
+            | true, channel ->
+                // Replace the signal before granting credit so a sender that
+                // missed this adjustment waits for the next one.
+                channel.WindowSignal.TrySetResult () |> ignore
+                manager.Channels.[recipientChannel] <-
+                    { channel with
+                        RemoteWindowSize = channel.RemoteWindowSize + bytesToAdd
+                        WindowSignal =
+                            System.Threading.Tasks.TaskCompletionSource<unit>(
+                                System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously) }
+                Ok manager)
 
     // Send EOF on a channel
     let sendChannelEof

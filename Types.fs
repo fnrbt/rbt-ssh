@@ -240,6 +240,11 @@ type ChannelState = {
     IsEof: bool
     PtyRequested: bool
     PtyTerm: string option
+    /// Completed when the peer grants more outbound window credit. A sender
+    /// that cannot fit its next packet waits on this instead of failing, and
+    /// each CHANNEL_WINDOW_ADJUST replaces it so a wait always observes the
+    /// adjustment that follows its own check.
+    WindowSignal: System.Threading.Tasks.TaskCompletionSource<unit>
 }
 
 module ChannelState =
@@ -255,6 +260,9 @@ module ChannelState =
         IsEof = false
         PtyRequested = false
         PtyTerm = None
+        WindowSignal =
+            System.Threading.Tasks.TaskCompletionSource<unit>(
+                System.Threading.Tasks.TaskCreationOptions.RunContinuationsAsynchronously)
     }
 
 /// Host key types

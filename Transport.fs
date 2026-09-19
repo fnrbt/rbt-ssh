@@ -274,6 +274,35 @@ module Transport =
                 return Error (ProtocolError "Encryption enabled but no keys available")
     }
 
+    /// Copy only the outbound cursors from `outcome` onto `onto`.
+    ///
+    /// A wire operation advances one direction. Publishing the whole state it
+    /// derived would also republish the peer direction as it was when the
+    /// operation started, discarding any packet the other actor read in the
+    /// meantime, so each direction is merged on its own.
+    let adoptWriteCursors (onto: TransportState) (outcome: TransportState) =
+        match onto.Role with
+        | Server ->
+            { onto with
+                ServerToClientSequence = outcome.ServerToClientSequence
+                ServerToClientIV = outcome.ServerToClientIV }
+        | Client ->
+            { onto with
+                ClientToServerSequence = outcome.ClientToServerSequence
+                ClientToServerIV = outcome.ClientToServerIV }
+
+    /// Copy only the inbound cursors from `outcome` onto `onto`.
+    let adoptReadCursors (onto: TransportState) (outcome: TransportState) =
+        match onto.Role with
+        | Server ->
+            { onto with
+                ClientToServerSequence = outcome.ClientToServerSequence
+                ClientToServerIV = outcome.ClientToServerIV }
+        | Client ->
+            { onto with
+                ServerToClientSequence = outcome.ServerToClientSequence
+                ServerToClientIV = outcome.ServerToClientIV }
+
     let sendMessage (stream: NetworkStream) (state: TransportState) (msg: SshMessage) = async {
         let payload = Packet.buildMessagePayload msg
         return! writePacket stream state payload

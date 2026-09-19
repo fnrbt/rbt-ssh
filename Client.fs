@@ -2,6 +2,7 @@ namespace Rbt.Ssh
 
 open System
 open System.Net.Sockets
+open System.Threading
 
 type ClientContext = {
     TransportState: TransportState
@@ -220,15 +221,34 @@ module Client =
         return! sendChannelRequest client channelId "exec" requestData
     }
 
-    /// Send data on a channel
+    /// Send data on a channel, waiting for peer window credit when the window
+    /// is exhausted instead of failing.
     let sendData (client: SshClient) (channelId: uint32) (data: byte[]) = async {
-        let ctx = !client.Context
-        let! result = Channel.sendChannelData client.Stream ctx.TransportState ctx.ChannelManager channelId data
-        match result with
-        | Error e -> return Error e
-        | Ok newTransport ->
-            client.Context := { !client.Context with TransportState = newTransport }
-            return Ok ()
+        let mutable position = 0
+        let mutable failure : SshResult<unit> option = None
+        while failure.IsNone && position < data.Length do
+            let pending = data.[position..]
+            match Channel.acquireOutboundCredit (!client.Context).ChannelManager channelId pending with
+            | Error e -> failure <- Some (Error e)
+            | Ok (Channel.Waiting signal) ->
+                match! Channel.waitForCredit signal CancellationToken.None with
+                | Error e -> failure <- Some (Error e)
+                | Ok () -> ()
+            | Ok (Channel.Granted chunk) ->
+                let ctx = !client.Context
+                match Channel.ChannelManager.getChannel ctx.ChannelManager channelId with
+                | None -> failure <- Some (Error (ChannelError $"Unknown channel: {channelId}"))
+                | Some channel ->
+                    let! result =
+                        Transport.sendMessage client.Stream ctx.TransportState (ChannelData(channel.RemoteChannel, chunk))
+                    match result with
+                    | Error e -> failure <- Some (Error e)
+                    | Ok newTransport ->
+                        client.Context := { !client.Context with TransportState = newTransport }
+                        position <- position + chunk.Length
+        match failure with
+        | Some result -> return result
+        | None -> return Ok ()
     }
 
     /// Send EOF on a channel

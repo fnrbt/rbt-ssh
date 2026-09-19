@@ -13,8 +13,19 @@ type SessionContext = {
     Username: string option
 }
 
+/// Per-session serialization. `Send` guards wire writes, `State` guards the
+/// shared transport cursors. Both critical sections are short and contain no
+/// awaits.
+type SessionLocks = {
+    Send: SemaphoreSlim
+    State: obj
+}
+
+module SessionLocks =
+    let create () = { Send = new SemaphoreSlim(1, 1); State = obj () }
+
 type ChannelCallbackFactory =
-    NetworkStream -> SessionContext ref -> SemaphoreSlim -> Auth.AuthState -> ChannelCallbacks
+    NetworkStream -> SessionContext ref -> SessionLocks -> Auth.AuthState -> ChannelCallbacks
 
 module Session =
 
@@ -27,27 +38,43 @@ module Session =
         Username = None
     }
 
-    let private withSendLock (sendLock: SemaphoreSlim) work = async {
-        do! sendLock.WaitAsync() |> Async.AwaitTask
+    let private withSendLock (locks: SessionLocks) work = async {
+        do! locks.Send.WaitAsync() |> Async.AwaitTask
         try
             return! work()
         finally
-            sendLock.Release() |> ignore
+            locks.Send.Release() |> ignore
     }
+
+    /// Publish the state a wire operation produced, adopting only the
+    /// direction that operation advanced. The read-merge-write runs under
+    /// `locks.State`, so a concurrent publish cannot interleave between the
+    /// read and the write.
+    let private publishTransport
+        (ctx: SessionContext ref)
+        (locks: SessionLocks)
+        (adopt: TransportState -> TransportState -> TransportState)
+        (outcome: TransportState) =
+        lock locks.State (fun () ->
+            let latest = ctx.Value
+            ctx.Value <- { latest with TransportState = adopt latest.TransportState outcome })
+
+    let private publishContext (ctx: SessionContext ref) (locks: SessionLocks) update =
+        lock locks.State (fun () -> ctx.Value <- update ctx.Value)
 
     let private sendMessageRef
         (stream: NetworkStream)
         (ctx: SessionContext ref)
-        (sendLock: SemaphoreSlim)
+        (locks: SessionLocks)
         (message: SshMessage) = async {
         return!
-            withSendLock sendLock (fun () -> async {
+            withSendLock locks (fun () -> async {
                 let current = !ctx
                 let! sent = Transport.sendMessage stream current.TransportState message
                 match sent with
                 | Error e -> return Error e
                 | Ok transport ->
-                    ctx := { !ctx with TransportState = transport }
+                    publishTransport ctx locks Transport.adoptWriteCursors transport
                     return Ok ()
             })
     }
@@ -55,48 +82,101 @@ module Session =
     let sendDataRef
         (stream: NetworkStream)
         (ctx: SessionContext ref)
-        (sendLock: SemaphoreSlim)
+        (locks: SessionLocks)
         (channelId: uint32)
-        (data: byte[]) = async {
-        return!
-            withSendLock sendLock (fun () -> async {
-                let current = !ctx
-                let! result = Channel.sendChannelData stream current.TransportState current.ChannelManager channelId data
-                match result with
-                | Error e -> return Error e
-                | Ok transport ->
-                    ctx := { !ctx with TransportState = transport }
-                    return Ok ()
-            })
+        (data: byte[])
+        (ct: CancellationToken) = async {
+        // Credit is acquired before taking the send lock and awaited while not
+        // holding it: the peer's CHANNEL_WINDOW_ADJUST arrives on the receive
+        // loop, which needs that same lock to publish its own sends.
+        let mutable position = 0
+        let mutable failure : SshResult<unit> option = None
+        while failure.IsNone && position < data.Length do
+            let pending = data.[position..]
+            match Channel.acquireOutboundCredit (!ctx).ChannelManager channelId pending with
+            | Error e -> failure <- Some (Error e)
+            | Ok (Channel.Waiting signal) ->
+                match! Channel.waitForCredit signal ct with
+                | Error e -> failure <- Some (Error e)
+                | Ok () -> ()
+            | Ok (Channel.Granted chunk) ->
+                let! sent =
+                    withSendLock locks (fun () -> async {
+                        let current = !ctx
+                        match Channel.ChannelManager.getChannel current.ChannelManager channelId with
+                        | None -> return Error (ChannelError $"Unknown channel: {channelId}")
+                        | Some channel ->
+                            let! result =
+                                Transport.sendMessage
+                                    stream
+                                    current.TransportState
+                                    (ChannelData(channel.RemoteChannel, chunk))
+                            match result with
+                            | Error e -> return Error e
+                            | Ok transport ->
+                                publishTransport ctx locks Transport.adoptWriteCursors transport
+                                return Ok ()
+                    })
+                match sent with
+                | Error e -> failure <- Some (Error e)
+                | Ok () -> position <- position + chunk.Length
+        match failure with
+        | Some result -> return result
+        | None -> return Ok ()
     }
 
     let sendExtendedDataRef
         (stream: NetworkStream)
         (ctx: SessionContext ref)
-        (sendLock: SemaphoreSlim)
+        (locks: SessionLocks)
         (channelId: uint32)
         (dataTypeCode: uint32)
-        (data: byte[]) = async {
-        return!
-            withSendLock sendLock (fun () -> async {
-                let current = !ctx
-                let! result = Channel.sendChannelExtendedData stream current.TransportState current.ChannelManager channelId dataTypeCode data
-                match result with
-                | Error e -> return Error e
-                | Ok transport ->
-                    ctx := { !ctx with TransportState = transport }
-                    return Ok ()
-            })
+        (data: byte[])
+        (ct: CancellationToken) = async {
+        let mutable position = 0
+        let mutable failure : SshResult<unit> option = None
+        while failure.IsNone && position < data.Length do
+            let pending = data.[position..]
+            match Channel.acquireOutboundCredit (!ctx).ChannelManager channelId pending with
+            | Error e -> failure <- Some (Error e)
+            | Ok (Channel.Waiting signal) ->
+                match! Channel.waitForCredit signal ct with
+                | Error e -> failure <- Some (Error e)
+                | Ok () -> ()
+            | Ok (Channel.Granted chunk) ->
+                let! sent =
+                    withSendLock locks (fun () -> async {
+                        let current = !ctx
+                        match Channel.ChannelManager.getChannel current.ChannelManager channelId with
+                        | None -> return Error (ChannelError $"Unknown channel: {channelId}")
+                        | Some channel ->
+                            let! result =
+                                Transport.sendMessage
+                                    stream
+                                    current.TransportState
+                                    (ChannelExtendedData(channel.RemoteChannel, dataTypeCode, chunk))
+                            match result with
+                            | Error e -> return Error e
+                            | Ok transport ->
+                                publishTransport ctx locks Transport.adoptWriteCursors transport
+                                return Ok ()
+                    })
+                match sent with
+                | Error e -> failure <- Some (Error e)
+                | Ok () -> position <- position + chunk.Length
+        match failure with
+        | Some result -> return result
+        | None -> return Ok ()
     }
 
     let closeChannelWithStatusRef
         (stream: NetworkStream)
         (ctx: SessionContext ref)
-        (sendLock: SemaphoreSlim)
+        (locks: SessionLocks)
         (channelId: uint32)
         (exitStatus: uint32) = async {
         return!
-            withSendLock sendLock (fun () -> async {
+            withSendLock locks (fun () -> async {
                 let current = !ctx
                 let! statusResult = Channel.sendExitStatus stream current.TransportState current.ChannelManager channelId exitStatus
                 match statusResult with
@@ -105,16 +185,16 @@ module Session =
                     let! eofResult = Channel.sendChannelEof stream stateAfterStatus current.ChannelManager channelId
                     match eofResult with
                     | Error e ->
-                        ctx := { !ctx with TransportState = stateAfterStatus }
+                        publishTransport ctx locks Transport.adoptWriteCursors stateAfterStatus
                         return Error e
                     | Ok stateAfterEof ->
                         let! closeResult = Channel.closeChannel stream stateAfterEof current.ChannelManager channelId
                         match closeResult with
                         | Error e ->
-                            ctx := { !ctx with TransportState = stateAfterEof }
+                            publishTransport ctx locks Transport.adoptWriteCursors stateAfterEof
                             return Error e
                         | Ok stateAfterClose ->
-                            ctx := { !ctx with TransportState = stateAfterClose }
+                            publishTransport ctx locks Transport.adoptWriteCursors stateAfterClose
                             return Ok ()
             })
     }
@@ -122,13 +202,13 @@ module Session =
     let private handleMessageRef
         (stream: NetworkStream)
         (ctx: SessionContext ref)
-        (sendLock: SemaphoreSlim)
+        (locks: SessionLocks)
         (msg: SshMessage)
         (channelCallbacks: ChannelCallbacks) = async {
 
         match msg with
         | Disconnect(reason, description, _) ->
-            ctx := { !ctx with State = SessionState.Disconnected }
+            publishContext ctx locks (fun latest -> { latest with State = SessionState.Disconnected })
             return Ok (), Some (SshError.Disconnected(reason, description))
 
         | Ignore _ | Unimplemented _ | Debug _ ->
@@ -136,14 +216,14 @@ module Session =
 
         | GlobalRequest(_, wantReply, _) ->
             if wantReply then
-                let! sent = sendMessageRef stream ctx sendLock RequestFailure
+                let! sent = sendMessageRef stream ctx locks RequestFailure
                 return sent, None
             else
                 return Ok (), None
 
         | ChannelOpen(channelType, senderChannel, initialWindowSize, maximumPacketSize, data) ->
             let! result =
-                withSendLock sendLock (fun () -> async {
+                withSendLock locks (fun () -> async {
                     let current = !ctx
                     return!
                         Channel.handleChannelOpen
@@ -153,7 +233,10 @@ module Session =
             match result with
             | Error e -> return Error e, None
             | Ok (transport, manager, _) ->
-                ctx := { !ctx with TransportState = transport; ChannelManager = manager }
+                publishContext ctx locks (fun latest ->
+                    { latest with
+                        TransportState = Transport.adoptWriteCursors latest.TransportState transport
+                        ChannelManager = manager })
                 return Ok (), None
 
         | ChannelRequest(recipientChannel, requestType, wantReply, data) ->
@@ -165,11 +248,11 @@ module Session =
             match result with
             | Error e -> return Error e, None
             | Ok (_, manager, success, replyChannelOpt) ->
-                ctx := { !ctx with ChannelManager = manager }
+                publishContext ctx locks (fun latest -> { latest with ChannelManager = manager })
                 match replyChannelOpt with
                 | Some remoteChannel ->
                     let reply = if success then ChannelSuccess(remoteChannel) else ChannelFailure(remoteChannel)
-                    let! sent = sendMessageRef stream ctx sendLock reply
+                    let! sent = sendMessageRef stream ctx locks reply
                     return sent, None
                 | None ->
                     return Ok (), None
@@ -180,9 +263,9 @@ module Session =
             match result with
             | Error e -> return Error e, None
             | Ok manager ->
-                ctx := { !ctx with ChannelManager = manager }
+                publishContext ctx locks (fun latest -> { latest with ChannelManager = manager })
                 let! adjustResult =
-                    withSendLock sendLock (fun () -> async {
+                    withSendLock locks (fun () -> async {
                         let latest = !ctx
                         return!
                             Channel.sendWindowAdjust
@@ -195,7 +278,7 @@ module Session =
                 match adjustResult with
                 | Error e -> return Error e, None
                 | Ok transport ->
-                    ctx := { !ctx with TransportState = transport }
+                    publishTransport ctx locks Transport.adoptWriteCursors transport
                     return Ok (), None
 
         | ChannelExtendedData(recipientChannel, dataTypeCode, data) ->
@@ -204,7 +287,7 @@ module Session =
             match result with
             | Error e -> return Error e, None
             | Ok manager ->
-                ctx := { !ctx with ChannelManager = manager }
+                publishContext ctx locks (fun latest -> { latest with ChannelManager = manager })
                 return Ok (), None
 
         | ChannelEof(recipientChannel) ->
@@ -213,19 +296,22 @@ module Session =
             match result with
             | Error e -> return Error e, None
             | Ok manager ->
-                ctx := { !ctx with ChannelManager = manager }
+                publishContext ctx locks (fun latest -> { latest with ChannelManager = manager })
                 return Ok (), None
 
         | ChannelClose(recipientChannel) ->
             let! result =
-                withSendLock sendLock (fun () -> async {
+                withSendLock locks (fun () -> async {
                     let current = !ctx
                     return! Channel.handleChannelClose stream current.TransportState current.ChannelManager channelCallbacks recipientChannel
                 })
             match result with
             | Error e -> return Error e, None
             | Ok (transport, manager) ->
-                ctx := { !ctx with TransportState = transport; ChannelManager = manager }
+                publishContext ctx locks (fun latest ->
+                    { latest with
+                        TransportState = Transport.adoptWriteCursors latest.TransportState transport
+                        ChannelManager = manager })
                 return Ok (), None
 
         | ChannelWindowAdjust(recipientChannel, bytesToAdd) ->
@@ -233,7 +319,7 @@ module Session =
             match Channel.handleWindowAdjust current.ChannelManager recipientChannel bytesToAdd with
             | Error e -> return Error e, None
             | Ok manager ->
-                ctx := { !ctx with ChannelManager = manager }
+                publishContext ctx locks (fun latest -> { latest with ChannelManager = manager })
                 return Ok (), None
 
         | ChannelSuccess _ | ChannelFailure _ ->
@@ -247,14 +333,14 @@ module Session =
 
         | _ ->
             let sequence = (!ctx).TransportState.ClientToServerSequence - 1u
-            let! sent = sendMessageRef stream ctx sendLock (Unimplemented sequence)
+            let! sent = sendMessageRef stream ctx locks (Unimplemented sequence)
             return sent, None
     }
 
     let runMessageLoopRef
         (stream: NetworkStream)
         (ctx: SessionContext ref)
-        (sendLock: SemaphoreSlim)
+        (locks: SessionLocks)
         (channelCallbacks: ChannelCallbacks) = async {
 
         let rec loop () = async {
@@ -266,16 +352,8 @@ module Session =
                 match received with
                 | Error e -> return Error e
                 | Ok (msg, transportAfterReceive) ->
-                    let latest = !ctx
-                    ctx := {
-                        latest with
-                            TransportState = {
-                                transportAfterReceive with
-                                    ServerToClientSequence = latest.TransportState.ServerToClientSequence
-                                    ServerToClientIV = latest.TransportState.ServerToClientIV
-                            }
-                    }
-                    let! handled = handleMessageRef stream ctx sendLock msg channelCallbacks
+                    publishTransport ctx locks Transport.adoptReadCursors transportAfterReceive
+                    let! handled = handleMessageRef stream ctx locks msg channelCallbacks
                     match handled with
                     | Error e, _ -> return Error e
                     | Ok (), Some (SshError.Disconnected _) -> return Ok !ctx
@@ -290,9 +368,9 @@ module Session =
         (ctx: SessionContext)
         (_authCallbacks: AuthCallbacks)
         (channelCallbacks: ChannelCallbacks) = async {
-        use sendLock = new SemaphoreSlim(1, 1)
+        let locks = SessionLocks.create ()
         let ctxRef = ref ctx
-        return! runMessageLoopRef stream ctxRef sendLock channelCallbacks
+        return! runMessageLoopRef stream ctxRef locks channelCallbacks
     }
 
     let runSessionWithFactory
@@ -338,7 +416,7 @@ module Session =
                     match authResult with
                     | Error e -> return Error e
                     | Ok (transportAfterAuth, authState) ->
-                        use sendLock = new SemaphoreSlim(1, 1)
+                        let locks = SessionLocks.create ()
                         let ctxRef = ref {
                             ctxAfterKex with
                                 TransportState = transportAfterAuth
@@ -346,8 +424,8 @@ module Session =
                                 State = Authenticated
                                 Username = authState.Username
                         }
-                        let channelCallbacks = channelFactory stream ctxRef sendLock authState
-                        return! runMessageLoopRef stream ctxRef sendLock channelCallbacks
+                        let channelCallbacks = channelFactory stream ctxRef locks authState
+                        return! runMessageLoopRef stream ctxRef locks channelCallbacks
     }
 
     let runSession
@@ -381,10 +459,31 @@ module Session =
         (ctx: SessionContext)
         (channelId: uint32)
         (data: byte[]) = async {
-        let! result = Channel.sendChannelData stream ctx.TransportState ctx.ChannelManager channelId data
-        match result with
-        | Error e -> return Error e, ctx
-        | Ok transport -> return Ok (), { ctx with TransportState = transport }
+        let mutable state = ctx.TransportState
+        let mutable position = 0
+        let mutable failure : SshResult<unit> option = None
+        while failure.IsNone && position < data.Length do
+            let pending = data.[position..]
+            match Channel.acquireOutboundCredit ctx.ChannelManager channelId pending with
+            | Error e -> failure <- Some (Error e)
+            | Ok (Channel.Waiting signal) ->
+                match! Channel.waitForCredit signal CancellationToken.None with
+                | Error e -> failure <- Some (Error e)
+                | Ok () -> ()
+            | Ok (Channel.Granted chunk) ->
+                match Channel.ChannelManager.getChannel ctx.ChannelManager channelId with
+                | None -> failure <- Some (Error (ChannelError $"Unknown channel: {channelId}"))
+                | Some channel ->
+                    let! result =
+                        Transport.sendMessage stream state (ChannelData(channel.RemoteChannel, chunk))
+                    match result with
+                    | Error e -> failure <- Some (Error e)
+                    | Ok newTransport ->
+                        state <- newTransport
+                        position <- position + chunk.Length
+        match failure with
+        | Some result -> return result, ctx
+        | None -> return Ok (), { ctx with TransportState = state }
     }
 
     let closeChannelWithStatus

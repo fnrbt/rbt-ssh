@@ -76,11 +76,11 @@ module ExecServer =
                         return n
             }
 
-    let private sendChunks (sendOne: byte[] -> Async<SshResult<unit>>) (data: byte[]) (_ct: CancellationToken) = task {
+    let private sendChunks (sendOne: byte[] -> Async<SshResult<unit>>) (data: byte[]) (ct: CancellationToken) = task {
         if data.Length > 0 then
             let mutable pos = 0
             let chunkSize = 16 * 1024
-            while pos < data.Length do
+            while pos < data.Length && not ct.IsCancellationRequested do
                 let n = min chunkSize (data.Length - pos)
                 let chunk = Array.zeroCreate<byte> n
                 Buffer.BlockCopy(data, pos, chunk, 0, n)
@@ -95,7 +95,7 @@ module ExecServer =
         (sessionCts: CancellationTokenSource)
         (stream: NetworkStream)
         (ctx: SessionContext ref)
-        (sendLock: SemaphoreSlim)
+        (locks: SessionLocks)
         (authState: Auth.AuthState) =
 
         let inputs = ConcurrentDictionary<uint32, System.Threading.Channels.Channel<byte[]>>()
@@ -103,18 +103,18 @@ module ExecServer =
 
         let write channelId data ct =
             sendChunks
-                (fun chunk -> Session.sendDataRef stream ctx sendLock channelId chunk)
+                (fun chunk -> Session.sendDataRef stream ctx locks channelId chunk ct)
                 data
                 ct
 
         let writeStderr channelId data ct =
             sendChunks
-                (fun chunk -> Session.sendExtendedDataRef stream ctx sendLock channelId 1u chunk)
+                (fun chunk -> Session.sendExtendedDataRef stream ctx locks channelId 1u chunk ct)
                 data
                 ct
 
         let exit channelId exitCode ct = task {
-            let! _ = Session.closeChannelWithStatusRef stream ctx sendLock channelId (uint32 exitCode) |> Async.StartAsTask
+            let! _ = Session.closeChannelWithStatusRef stream ctx locks channelId (uint32 exitCode) |> Async.StartAsTask
             return ()
         }
 
@@ -178,6 +178,7 @@ module ExecServer =
         (client: TcpClient)
         (config: ServerConfig)
         (callbacks: ExecServerCallbacks)
+        (onSessionError: exn -> unit)
         (ct: CancellationToken) = async {
 
         use client = client
@@ -188,17 +189,22 @@ module ExecServer =
                 ValidatePassword = callbacks.ValidatePassword
                 ValidatePublicKey = callbacks.ValidatePublicKey
             }
-            let! _ =
+            let! result =
                 Session.runSessionWithFactory
                     stream
                     config
                     authCallbacks
-                    (fun stream ctx sendLock auth ->
-                        makeChannelCallbacks callbacks sessionCts stream ctx sendLock auth)
-            return ()
+                    (fun stream ctx locks auth ->
+                        makeChannelCallbacks callbacks sessionCts stream ctx locks auth)
+            match result with
+            | Ok _ -> ()
+            | Error error -> onSessionError (InvalidOperationException(sprintf "%A" error))
         with
         | :? OperationCanceledException -> ()
-        | _ -> ()
+        | ex -> onSessionError ex
+        // Release any exec writer still blocked on this session before the
+        // transport goes away.
+        sessionCts.Cancel()
     }
 
     let startAsync
@@ -206,6 +212,7 @@ module ExecServer =
         (port: int)
         (config: ServerConfig)
         (callbacks: ExecServerCallbacks)
+        (onSessionError: exn -> unit)
         (ct: CancellationToken) = async {
         let listener = new TcpListener(address, port)
         try
@@ -213,7 +220,7 @@ module ExecServer =
             while not ct.IsCancellationRequested do
                 try
                     let! client = listener.AcceptTcpClientAsync(ct).AsTask() |> Async.AwaitTask
-                    Async.Start(handleClient client config callbacks ct, ct)
+                    Async.Start(handleClient client config callbacks onSessionError ct, ct)
                 with
                 | :? OperationCanceledException -> ()
                 | :? ObjectDisposedException -> ()
