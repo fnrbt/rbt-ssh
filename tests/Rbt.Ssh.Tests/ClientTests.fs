@@ -114,3 +114,39 @@ let ``a host key that is not the pinned one is refused`` () =
             failwith "connected to a server whose host key was not pinned"
         | Error _ -> ()
     | _ -> ()
+
+[<Fact>]
+let ``output past the initial window keeps flowing`` () =
+    match hostFingerprint (), keyFile "id_ed25519" with
+    | Some fp, Some path ->
+        match connect [ ClientAuth.PublicKeyAuth(parseOrFail path) ] (Fingerprint [ fp ]) with
+        | Error e -> failwith $"connect failed: {e}"
+        | Ok client ->
+            try
+                // 6 MB on stdout, three times the 2 MB initial window.
+                let run = Client.exec client "head -c 6291456 /dev/zero" |> Async.StartAsTask
+                Assert.True(run.Wait(TimeSpan.FromSeconds 30.0), "exec stalled")
+                match run.Result with
+                | Error e -> failwith $"exec failed: {e}"
+                | Ok (code, stdout, _) ->
+                    Assert.Equal(0u, code)
+                    Assert.Equal(6291456, stdout.Length)
+            finally
+                Client.disconnect client |> Async.RunSynchronously
+    | _ -> ()
+
+[<Fact>]
+let ``one connection runs several commands`` () =
+    match hostFingerprint (), keyFile "id_ed25519" with
+    | Some fp, Some path ->
+        match connect [ ClientAuth.PublicKeyAuth(parseOrFail path) ] (Fingerprint [ fp ]) with
+        | Error e -> failwith $"connect failed: {e}"
+        | Ok client ->
+            try
+                for i in 1 .. 3 do
+                    match Client.exec client $"echo {i}" |> Async.RunSynchronously with
+                    | Error e -> failwith $"exec {i} failed: {e}"
+                    | Ok (_, stdout, _) -> Assert.Equal($"{i}\n", Encoding.UTF8.GetString stdout)
+            finally
+                Client.disconnect client |> Async.RunSynchronously
+    | _ -> ()

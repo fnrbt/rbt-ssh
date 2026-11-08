@@ -132,7 +132,9 @@ module Client =
                         return Error (ChannelError $"Channel open rejected ({reasonCode}): {description}")
                     | GlobalRequest(_, wantReply, _) ->
                         if wantReply then
-                            let! _ = Transport.sendMessage client.Stream (!client.Context).TransportState RequestFailure
+                            match! Transport.sendMessage client.Stream (!client.Context).TransportState RequestFailure with
+                            | Ok transport -> client.Context := { !client.Context with TransportState = transport }
+                            | Error _ -> ()
                             ()
                         return! waitForConfirmation ()
                     | _ ->
@@ -271,14 +273,33 @@ module Client =
         | Ok (msg, newTransportState) ->
             client.Context := { !client.Context with TransportState = newTransportState }
 
+            // Give the server back the window the data used, so output past
+            // the initial window (2 MB) keeps flowing instead of stalling.
+            let replenish (recipientChannel: uint32) (length: int) = async {
+                if length = 0 then return Ok ()
+                else
+                    let current = !client.Context
+                    let! adjusted =
+                        Channel.sendWindowAdjust client.Stream current.TransportState current.ChannelManager recipientChannel (uint32 length)
+                    match adjusted with
+                    | Ok transport ->
+                        client.Context := { !client.Context with TransportState = transport }
+                        return Ok ()
+                    | Error e -> return Error e
+            }
+
             match msg with
             | ChannelData(recipientChannel, data) ->
                 do! callbacks.OnStdout recipientChannel data
-                return Ok true
+                match! replenish recipientChannel data.Length with
+                | Ok () -> return Ok true
+                | Error e -> return Error e
 
             | ChannelExtendedData(recipientChannel, _dataTypeCode, data) ->
                 do! callbacks.OnStderr recipientChannel data
-                return Ok true
+                match! replenish recipientChannel data.Length with
+                | Ok () -> return Ok true
+                | Error e -> return Error e
 
             | ChannelRequest(_, "exit-status", _, data) ->
                 let exitStatus = Packet.readUint32 data 0
@@ -293,8 +314,12 @@ module Client =
                 // Send close back
                 match Channel.ChannelManager.getChannel (!client.Context).ChannelManager recipientChannel with
                 | Some channel ->
-                    let! _ = Transport.sendMessage client.Stream (!client.Context).TransportState (ChannelClose(channel.RemoteChannel))
-                    ()
+                    // Keep the advanced transport state: discarding it reused
+                    // the outbound sequence number and cipher counter, so the
+                    // next packet failed the server's MAC check.
+                    match! Transport.sendMessage client.Stream (!client.Context).TransportState (ChannelClose(channel.RemoteChannel)) with
+                    | Ok transport -> client.Context := { !client.Context with TransportState = transport }
+                    | Error _ -> ()
                 | None -> ()
                 do! callbacks.OnChannelClose recipientChannel
                 return Ok false  // Channel closed, done
