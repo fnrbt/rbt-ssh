@@ -48,7 +48,8 @@ let ``an rsa key file parses to its public key`` () =
 
 [<Fact>]
 let ``non-OpenSSH and empty key text is refused with a reason`` () =
-    for text in [ ""; "hello"; "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----" ] do
+    for text in [ ""; "hello"; "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----"
+                  "-----BEGIN OPENSSH PRIVATE KEY-----\nnot base64\n-----END OPENSSH PRIVATE KEY-----" ] do
         match PrivateKeyFile.parse text with
         | Ok _ -> failwith $"accepted {text}"
         | Error message -> Assert.False(String.IsNullOrWhiteSpace message)

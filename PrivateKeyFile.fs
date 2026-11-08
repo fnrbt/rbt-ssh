@@ -89,7 +89,8 @@ module PrivateKeyFile =
         let last = lines |> Array.tryFindIndex ((=) "-----END OPENSSH PRIVATE KEY-----")
         match first, last with
         | Some first, Some last when last > first ->
-            Ok(Convert.FromBase64String(String.Concat(lines.[first + 1 .. last - 1])))
+            try Ok(Convert.FromBase64String(String.Concat(lines.[first + 1 .. last - 1])))
+            with :? FormatException -> Error "the private key's body is not base64 (was it copied whole?)"
         | _ when lines |> Array.exists (fun line -> line.StartsWith "-----BEGIN" && line.Contains "PRIVATE KEY") ->
             Error "only OpenSSH-format private keys are supported (ssh-keygen's default; convert a PEM key with ssh-keygen -p -f <file>)"
         | _ -> Error "not an OpenSSH private key (expected -----BEGIN OPENSSH PRIVATE KEY-----)"
