@@ -9,6 +9,7 @@
   <ItemGroup>
     <Compile Include="Types.fs" />
     <Compile Include="Crypto.fs" />
+    <Compile Include="PrivateKeyFile.fs" />
     <Compile Include="Packet.fs" />
     <Compile Include="Transport.fs" />
     <Compile Include="KeyExchange.fs" />
@@ -26,6 +27,7 @@
   <ItemGroup>
     <PackageReference Include="NSec.Cryptography" Version="24.4.0" />
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.5.1" />
+    <PackageReference Update="FSharp.Core" Version="10.1.302" />
   </ItemGroup>
 
 </Project>

@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="Rbt.Ssh.fsproj" />
+  <Folder Name="/tests/">
+    <Project Path="tests/Rbt.Ssh.Tests/Rbt.Ssh.Tests.fsproj" />
+  </Folder>
+</Solution>
