@@ -156,7 +156,7 @@ module Auth =
                                                     algorithmName
                                                     publicKeyBlob
 
-                            let signatureValid = Crypto.verifyPublicKeySignature publicKeyBlob signature signatureData
+                            let signatureValid = Crypto.verifyPublicKeySignature algorithmName publicKeyBlob signature signatureData
 
                             if signatureValid then
                                 match authResult with

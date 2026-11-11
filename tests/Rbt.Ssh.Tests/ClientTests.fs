@@ -151,3 +151,70 @@ let ``one connection runs several commands`` () =
             finally
                 Client.disconnect client |> Async.RunSynchronously
     | _ -> ()
+
+[<Fact>]
+let ``a rejected key falls back to password authentication`` () =
+    match execOn [ ClientAuth.PublicKeyAuth(Crypto.createEd25519HostKey()); ClientAuth.PasswordAuth "secret" ] with
+    | None -> ()
+    | Some (code, stdout, stderr) ->
+        Assert.Equal(3u, code)
+        Assert.Equal("out", Encoding.UTF8.GetString stdout)
+        Assert.Equal("err", Encoding.UTF8.GetString stderr)
+
+[<Fact>]
+let ``full duplex input crosses the channel window without corrupting transport`` () =
+    match hostFingerprint (), keyFile "id_ed25519" with
+    | Some fp, Some path ->
+        match connect [ ClientAuth.PublicKeyAuth(parseOrFail path) ] (Fingerprint [ fp ]) with
+        | Error e -> failwith $"connect failed: {e}"
+        | Ok client ->
+            let requireOk = function Ok value -> value | Error error -> failwithf "%A" error
+            try
+                let channelId = Client.openChannel client |> Async.RunSynchronously |> requireOk
+                Client.requestExec client channelId "cat" |> Async.RunSynchronously |> requireOk
+                let expected = Array.init (3 * 1024 * 1024) (fun index -> byte (index % 251))
+                let stdout = System.Collections.Generic.List<byte>()
+                let stderr = System.Collections.Generic.List<byte>()
+                let mutable exit = None
+                let callbacks = {
+                    OnStdout = fun id data -> async {
+                        Assert.Equal(channelId, id)
+                        stdout.AddRange(data)
+                    }
+                    OnStderr = fun _ data -> async { stderr.AddRange(data) }
+                    OnExit = fun id code -> async { exit <- Some (id, code) }
+                    OnChannelClose = fun _ -> async { () }
+                }
+                let receiving = Client.receiveLoop client callbacks |> Async.StartAsTask
+                let sending = Async.StartAsTask(async {
+                    let! sent = Client.sendData client channelId expected
+                    requireOk sent
+                    return! Client.sendEof client channelId
+                })
+                Assert.True(sending.Wait(TimeSpan.FromSeconds 30.0), "stdin stalled")
+                requireOk sending.Result
+                Assert.True(receiving.Wait(TimeSpan.FromSeconds 30.0), "stdout stalled")
+                requireOk receiving.Result
+                Assert.Equal(Some (channelId, 0u), exit)
+                Assert.Empty(stderr)
+                Assert.True((expected = stdout.ToArray()), "echoed bytes differ from stdin")
+            finally
+                Client.disconnect client |> Async.RunSynchronously
+    | _ -> ()
+
+[<Fact>]
+let ``default host trust rejects an otherwise valid server`` () =
+    match hostFingerprint () with
+    | None -> ()
+    | Some _ ->
+        let config = { ClientConfig.defaults with Username = "tester" }
+        let result =
+            Client.connectAsync "127.0.0.1" port config
+                { Username = "tester"; Methods = [ ClientAuth.PasswordAuth "secret" ] }
+            |> Async.RunSynchronously
+        match result with
+        | Error (CryptoError _) -> ()
+        | Error error -> failwithf "unexpected failure: %A" error
+        | Ok client ->
+            Client.disconnect client |> Async.RunSynchronously
+            failwith "authenticated without configuring host trust"

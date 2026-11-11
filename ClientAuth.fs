@@ -13,6 +13,14 @@ module ClientAuth =
         Methods: ClientAuthMethod list
     }
 
+    // Banners may precede any authentication response.
+    let rec private receiveResponse (stream: NetworkStream) state = async {
+        let! result = Transport.receiveMessage stream state
+        match result with
+        | Ok (UserAuthBanner _, nextState) -> return! receiveResponse stream nextState
+        | _ -> return result
+    }
+
     /// Send SERVICE_REQUEST and wait for SERVICE_ACCEPT
     let private requestService
         (stream: NetworkStream)
@@ -23,7 +31,7 @@ module ClientAuth =
         match sendResult with
         | Error e -> return Error e
         | Ok stateAfterSend ->
-            let! recvResult = Transport.receiveMessage stream stateAfterSend
+            let! recvResult = receiveResponse stream stateAfterSend
             match recvResult with
             | Error e -> return Error e
             | Ok (msg, stateAfterRecv) ->
@@ -70,12 +78,12 @@ module ClientAuth =
         match sendResult with
         | Error e -> return Error e
         | Ok stateAfterQuery ->
-            let! recvResult = Transport.receiveMessage stream stateAfterQuery
+            let! recvResult = receiveResponse stream stateAfterQuery
             match recvResult with
             | Error e -> return Error e
             | Ok (msg, stateAfterRecv) ->
                 match msg with
-                | UserAuthPkOk(_algName, _keyBlob) ->
+                | UserAuthPkOk(algName, keyBlob) when algName = algorithmName && keyBlob = hostKey.PublicKeyBlob ->
                     // Key is acceptable, sign and send full request
                     let signatureData = Auth.buildPublicKeySignatureData
                                             sessionId username "ssh-connection"
@@ -88,13 +96,9 @@ module ClientAuth =
                     match sendResult2 with
                     | Error e -> return Error e
                     | Ok stateAfterAuth ->
-                        return Ok stateAfterAuth
-                | UserAuthFailure _ ->
-                    // Key not accepted, return state so caller can try next method
-                    return Ok stateAfterRecv
-                | UserAuthSuccess ->
-                    // Some servers accept on query alone (unlikely but handle it)
-                    return Ok stateAfterRecv
+                        return Ok (stateAfterAuth, None)
+                | UserAuthFailure _ as response ->
+                    return Ok (stateAfterRecv, Some response)
                 | _ ->
                     return Error (ProtocolError "Unexpected response to publickey query")
     }
@@ -120,15 +124,19 @@ module ClientAuth =
                     let! stateAfterAttempt = async {
                         match method with
                         | PasswordAuth password ->
-                            return! tryPassword stream state config.Username password
+                            let! result = tryPassword stream state config.Username password
+                            return Result.map (fun nextState -> nextState, None) result
                         | PublicKeyAuth key ->
                             return! tryPublicKey stream state sessionId config.Username key
                     }
                     match stateAfterAttempt with
                     | Error e -> return Error e
-                    | Ok newState ->
-                        // Read response (may already have been read for pubkey query)
-                        let! recvResult = Transport.receiveMessage stream newState
+                    | Ok (newState, response) ->
+                        let! recvResult = async {
+                            match response with
+                            | Some msg -> return Ok (msg, newState)
+                            | None -> return! receiveResponse stream newState
+                        }
                         match recvResult with
                         | Error e -> return Error e
                         | Ok (msg, stateAfterRecv) ->
@@ -137,19 +145,6 @@ module ClientAuth =
                                 return Ok stateAfterRecv
                             | UserAuthFailure(_availableMethods, _partialSuccess) ->
                                 return! tryMethods stateAfterRecv remaining
-                            | UserAuthBanner(_message, _) ->
-                                // Banner can appear before success/failure, read again
-                                let! recvResult2 = Transport.receiveMessage stream stateAfterRecv
-                                match recvResult2 with
-                                | Error e -> return Error e
-                                | Ok (msg2, stateAfterRecv2) ->
-                                    match msg2 with
-                                    | UserAuthSuccess ->
-                                        return Ok stateAfterRecv2
-                                    | UserAuthFailure _ ->
-                                        return! tryMethods stateAfterRecv2 remaining
-                                    | _ ->
-                                        return Error (ProtocolError "Unexpected message during auth")
                             | _ ->
                                 return Error (ProtocolError "Unexpected message during auth")
             }

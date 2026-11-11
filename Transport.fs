@@ -72,9 +72,9 @@ module Transport =
     let private readLineAsync (stream: NetworkStream) = async {
         let buffer = ResizeArray<byte>()
         let singleByte = Array.zeroCreate<byte> 1
-
+        let! cancellationToken = Async.CancellationToken
         let rec readLoop () = async {
-            let! bytesRead = stream.ReadAsync(singleByte, 0, 1) |> Async.AwaitTask
+            let! bytesRead = stream.ReadAsync(singleByte.AsMemory(), cancellationToken).AsTask() |> Async.AwaitTask
             if bytesRead = 0 then
                 return None
             else
@@ -115,7 +115,8 @@ module Transport =
     let private sendVersion (stream: NetworkStream) (version: string) = async {
         let versionLine = version + "\r\n"
         let versionBytes = Encoding.ASCII.GetBytes(versionLine)
-        do! stream.WriteAsync(versionBytes, 0, versionBytes.Length) |> Async.AwaitTask
+        let! cancellationToken = Async.CancellationToken
+        do! stream.WriteAsync(versionBytes.AsMemory(), cancellationToken).AsTask() |> Async.AwaitTask
     }
 
     /// Server-side version exchange: send server version, read client version
@@ -135,31 +136,37 @@ module Transport =
     }
 
     let private readExactAsync (stream: NetworkStream) (count: int) = async {
+        let! cancellationToken = Async.CancellationToken
         let buffer = Array.zeroCreate<byte> count
         let mutable totalRead = 0
         while totalRead < count do
-            let! bytesRead = stream.ReadAsync(buffer, totalRead, count - totalRead) |> Async.AwaitTask
+            let! bytesRead = stream.ReadAsync(buffer.AsMemory(totalRead, count - totalRead), cancellationToken).AsTask() |> Async.AwaitTask
             if bytesRead = 0 then
-                failwith "Connection closed"
+                raise (EndOfStreamException "Connection closed while reading SSH packet")
             totalRead <- totalRead + bytesRead
         return buffer
     }
 
-    let readPacket (stream: NetworkStream) (state: TransportState) = async {
+    let private validPacketLength blockSize length =
+        length <= Constants.MaxPacketSize
+        && length >= uint32 (max 16 blockSize - 4)
+        && (uint64 length + 4UL) % uint64 blockSize = 0UL
+
+    let private readPacketCore (stream: NetworkStream) (state: TransportState) = async {
         if not state.EncryptionEnabled then
             // Unencrypted packet
             let! lengthBytes = readExactAsync stream 4
-            let packetLength = int (Packet.readUint32 lengthBytes 0)
-
-            if packetLength < 1 || packetLength > int Constants.MaxPacketSize then
-                return Error (ProtocolError $"Invalid packet length: {packetLength}")
+            let length = Packet.readUint32 lengthBytes 0
+            if not (validPacketLength 8 length) then
+                return Error (ProtocolError $"Invalid packet length: {length}")
             else
+                let packetLength = int length
                 let! packetData = readExactAsync stream packetLength
                 let paddingLength = int packetData.[0]
                 let payloadLength = packetLength - paddingLength - 1
 
-                if payloadLength < 0 || paddingLength < 4 then
-                    return Error (ProtocolError "Invalid packet structure")
+                if payloadLength < 1 || paddingLength < 4 then
+                    return Error (ProtocolError "Invalid packet padding or empty payload")
                 else
                     let payload = packetData.[1..payloadLength]
                     let readSeq =
@@ -185,14 +192,14 @@ module Transport =
                         newIv.[i] <- byte (sum &&& 0xFF)
                         carry <- sum >>> 8
 
-                let packetLength = int (Packet.readUint32 decryptedFirstBlock 0)
-
-                if packetLength < 1 || packetLength > int Constants.MaxPacketSize then
-                    return Error (ProtocolError $"Invalid encrypted packet length: {packetLength}")
+                let length = Packet.readUint32 decryptedFirstBlock 0
+                if not (validPacketLength blockSize length) then
+                    return Error (ProtocolError $"Invalid encrypted packet length: {length}")
                 else
+                    let packetLength = int length
                     let totalEncryptedLength = 4 + packetLength
                     let remainingEncrypted = totalEncryptedLength - blockSize
-                    let blocksRemaining = (remainingEncrypted + blockSize - 1) / blockSize
+                    let blocksRemaining = remainingEncrypted / blockSize
 
                     let! remainingData = readExactAsync stream (blocksRemaining * blockSize)
                     let! mac = readExactAsync stream Constants.MacLength
@@ -226,17 +233,34 @@ module Transport =
                     else
                         let paddingLength = int fullDecrypted.[4]
                         let payloadLength = packetLength - paddingLength - 1
-                        let payload = fullDecrypted.[5..5 + payloadLength - 1]
-                        let newState = updateReadState state (readSeq + 1u) (Some currentIv)
-                        return Ok (payload, newState)
+                        if paddingLength < 4 || payloadLength < 1 then
+                            return Error (ProtocolError "Invalid encrypted packet padding or empty payload")
+                        else
+                            let payload = fullDecrypted.[5..5 + payloadLength - 1]
+                            let newState = updateReadState state (readSeq + 1u) (Some currentIv)
+                            return Ok (payload, newState)
             | _ ->
                 return Error (ProtocolError "Encryption enabled but no keys available")
     }
 
-    let writePacket (stream: NetworkStream) (state: TransportState) (payload: byte[]) = async {
+    /// Return structured errors for malformed packets and closed connections.
+    /// Ambient async cancellation propagates to network reads without conversion.
+    let readPacket (stream: NetworkStream) (state: TransportState) = async {
+        try
+            return! readPacketCore stream state
+        with
+        | :? EndOfStreamException as ex -> return Error (ConnectionError ex.Message)
+        | :? IOException as ex -> return Error (ConnectionError ex.Message)
+        | :? ObjectDisposedException as ex -> return Error (ConnectionError ex.Message)
+        | :? SocketException as ex -> return Error (ConnectionError ex.Message)
+        | :? ArgumentException as ex -> return Error (CryptoError ex.Message)
+    }
+
+    let private writePacketCore (stream: NetworkStream) (state: TransportState) (payload: byte[]) = async {
         if not state.EncryptionEnabled then
             let packet = Packet.buildPacket payload 8
-            do! stream.WriteAsync(packet, 0, packet.Length) |> Async.AwaitTask
+            let! cancellationToken = Async.CancellationToken
+            do! stream.WriteAsync(packet.AsMemory(), cancellationToken).AsTask() |> Async.AwaitTask
             let writeSeq =
                 match state.Role with
                 | Server -> state.ServerToClientSequence
@@ -267,11 +291,20 @@ module Transport =
                             carry <- sum >>> 8
 
                 let output = Array.append encrypted mac
-                do! stream.WriteAsync(output, 0, output.Length) |> Async.AwaitTask
+                let! cancellationToken = Async.CancellationToken
+                do! stream.WriteAsync(output.AsMemory(), cancellationToken).AsTask() |> Async.AwaitTask
 
                 return Ok (updateWriteState state (writeSeq + 1u) (Some newIv))
             | _ ->
                 return Error (ProtocolError "Encryption enabled but no keys available")
+    }
+
+    /// Reject invalid outbound packet sizes and padding as protocol errors.
+    let writePacket (stream: NetworkStream) (state: TransportState) (payload: byte[]) = async {
+        try
+            return! writePacketCore stream state payload
+        with :? ArgumentException as ex ->
+            return Error (ProtocolError ex.Message)
     }
 
     /// Copy only the outbound cursors from `outcome` onto `onto`.
@@ -308,14 +341,23 @@ module Transport =
         return! writePacket stream state payload
     }
 
-    let receiveMessage (stream: NetworkStream) (state: TransportState) = async {
+    /// Receive a message and its exact wire payload, including the message-type byte.
+    /// Malformed message fields return ProtocolError rather than escaping the transport.
+    let receiveMessageWithPayload (stream: NetworkStream) (state: TransportState)
+        : Async<SshResult<SshMessage * byte[] * TransportState>> = async {
         let! result = readPacket stream state
         match result with
+        | Error error -> return Error error
         | Ok (payload, newState) ->
-            let msg = Packet.parseMessage payload
-            return Ok (msg, newState)
-        | Error e ->
-            return Error e
+            try
+                return Ok (Packet.parseMessage payload, payload, newState)
+            with :? ArgumentException as ex ->
+                return Error (ProtocolError ex.Message)
+    }
+
+    let receiveMessage (stream: NetworkStream) (state: TransportState) = async {
+        let! result = receiveMessageWithPayload stream state
+        return result |> Result.map (fun (message, _, newState) -> message, newState)
     }
 
     let enableEncryption (state: TransportState) (keys: DerivedKeys) =

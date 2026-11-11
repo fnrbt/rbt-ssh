@@ -25,7 +25,6 @@ module KeyExchange =
                 | "rsa" -> [
                     Algorithms.HOSTKEY_RSA_SHA2_256
                     Algorithms.HOSTKEY_RSA_SHA2_512
-                    Algorithms.HOSTKEY_SSH_RSA
                   ]
                 | _ -> []
             )
@@ -92,7 +91,7 @@ module KeyExchange =
             Packet.writeBytes hostKeyBlob
             Packet.writeBytes clientEphemeralPublic
             Packet.writeBytes serverEphemeralPublic
-            Packet.writeMpint sharedSecret
+            Crypto.encodePositiveMpint sharedSecret
         |]
 
         Crypto.sha256 hashInput
@@ -102,11 +101,17 @@ module KeyExchange =
         hostKeys |> List.tryFind (fun hk ->
             match hk.KeyType, algorithmName with
             | HostKeyType.Ed25519, alg when alg = Algorithms.HOSTKEY_SSH_ED25519 -> true
-            | HostKeyType.Rsa, alg when alg = Algorithms.HOSTKEY_SSH_RSA
-                                     || alg = Algorithms.HOSTKEY_RSA_SHA2_256
+            | HostKeyType.Rsa, alg when alg = Algorithms.HOSTKEY_RSA_SHA2_256
                                      || alg = Algorithms.HOSTKEY_RSA_SHA2_512 -> true
             | _ -> false
         )
+
+    /// Whether a peer's optimistic KEX packet must be ignored (RFC 4253 section 7.1).
+    let incorrectGuess message kexAlgorithm hostKeyAlgorithm =
+        match message with
+        | KexInit(_, kex, hostKeys, _, _, _, _, _, _, _, _, follows) ->
+            follows && (List.tryHead kex <> Some kexAlgorithm || List.tryHead hostKeys <> Some hostKeyAlgorithm)
+        | _ -> false
 
     // Perform curve25519-sha256 key exchange (server side)
     let performKeyExchange
@@ -223,14 +228,12 @@ module KeyExchange =
         | Error e -> return Error e
         | Ok stateAfterKexInit ->
             // Receive client KEXINIT
-            let! recvResult = Transport.receiveMessage stream stateAfterKexInit
+            let! recvResult = Transport.receiveMessageWithPayload stream stateAfterKexInit
             match recvResult with
             | Error e -> return Error e
-            | Ok (clientMsg, stateAfterClientKexInit) ->
+            | Ok (clientMsg, clientKexPayload, stateAfterClientKexInit) ->
                 match clientMsg with
                 | KexInit _ as clientKexInit ->
-                    let clientKexPayload = Packet.buildMessagePayload clientKexInit
-
                     // Negotiate algorithms
                     match negotiateAlgorithms clientKexInit serverKexInit with
                     | Error e -> return Error e
@@ -246,7 +249,14 @@ module KeyExchange =
                                     ServerKexInit = Some serverKexPayload
                             }
 
-                            return! performKeyExchange stream stateAfterClientKexInit kexState hostKeys hostKeyAlg
+                            if incorrectGuess clientKexInit kexAlg hostKeyAlg then
+                                let! ignored = Transport.readPacket stream stateAfterClientKexInit
+                                match ignored with
+                                | Error e -> return Error e
+                                | Ok (_, stateAfterGuess) ->
+                                    return! performKeyExchange stream stateAfterGuess kexState hostKeys hostKeyAlg
+                            else
+                                return! performKeyExchange stream stateAfterClientKexInit kexState hostKeys hostKeyAlg
                 | _ ->
                     return Error (ProtocolError "Expected KEXINIT from client")
     }

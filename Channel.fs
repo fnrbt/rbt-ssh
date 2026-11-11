@@ -9,6 +9,8 @@ module Channel =
 
     type ChannelManager = {
         Channels: Dictionary<uint32, ChannelState>
+        /// Channels whose ordinary data credit is returned by the consumer.
+        DeferredInput: HashSet<uint32>
         NextChannelId: uint32
         /// Guards `Channels`. The receive loop mutates channel records while
         /// an exec writer reads and mutates the same records, so every access
@@ -19,6 +21,7 @@ module Channel =
     module ChannelManager =
         let create () = {
             Channels = Dictionary<uint32, ChannelState>()
+            DeferredInput = HashSet<uint32>()
             NextChannelId = 0u
             Sync = obj ()
         }
@@ -47,7 +50,10 @@ module Channel =
             lock manager.Sync (fun () ->
                 match manager.Channels.TryGetValue(channelId) with
                 | true, channel ->
-                    manager.Channels.[channelId] <- update channel
+                    let updated = update channel
+                    manager.Channels.[channelId] <- updated
+                    if updated.IsClosed && not channel.IsClosed then
+                        channel.WindowSignal.TrySetResult () |> ignore
                     true
                 | false, _ -> false)
 
@@ -58,6 +64,7 @@ module Channel =
                     // Release any sender waiting for credit on this channel.
                     channel.WindowSignal.TrySetResult () |> ignore
                 | false, _ -> ()
+                manager.DeferredInput.Remove(channelId) |> ignore
                 manager.Channels.Remove(channelId) |> ignore)
 
     /// Outcome of asking to send `requested` bytes of channel data.
@@ -71,41 +78,42 @@ module Channel =
     /// Reserve up to one packet of outbound credit, or report the signal that
     /// announces the next CHANNEL_WINDOW_ADJUST. Checking the window and
     /// capturing the signal happen under one lock hold, so an adjustment that
-    /// lands between the two can never be missed.
+    /// lands between the two can never be missed. Only the granted segment
+    /// starting at `offset` is copied, never the unsent remainder.
     let acquireOutboundCredit
         (manager: ChannelManager)
         (localChannel: uint32)
-        (data: byte[]) =
+        (data: byte[])
+        (offset: int) =
         lock manager.Sync (fun () ->
             match manager.Channels.TryGetValue(localChannel) with
             | false, _ -> Error (ChannelError $"Unknown channel: {localChannel}")
+            | true, channel when channel.IsClosed -> Error (ChannelError $"Channel is closed: {localChannel}")
+            | true, _ when offset < 0 || offset >= data.Length ->
+                Error (ChannelError "Outbound data offset is outside the buffer")
             | true, channel ->
-                let packetLimit = min (uint32 data.Length) channel.RemoteMaxPacketSize
+                let packetLimit = min (uint32 (data.Length - offset)) channel.RemoteMaxPacketSize
                 if channel.RemoteWindowSize = 0u || packetLimit = 0u then
                     Ok (Waiting channel.WindowSignal)
                 else
                     let granted = min packetLimit channel.RemoteWindowSize
                     manager.Channels.[localChannel] <-
                         { channel with RemoteWindowSize = channel.RemoteWindowSize - granted }
-                    Ok (Granted data.[.. int granted - 1]))
+                    Ok (Granted data.[offset .. offset + int granted - 1]))
 
     /// Await an outbound credit signal. Returns an error if the send is
     /// cancelled while waiting.
     let waitForCredit
         (signal: System.Threading.Tasks.TaskCompletionSource<unit>)
         (ct: CancellationToken) = async {
-        if ct.IsCancellationRequested then
-            return Error (ChannelError "Channel send cancelled")
-        else
-            let! completed =
-                System.Threading.Tasks.Task.WhenAny(
-                    signal.Task,
-                    System.Threading.Tasks.Task.Delay(Timeout.Infinite, ct))
-                |> Async.AwaitTask
-            return
-                if completed.Status = System.Threading.Tasks.TaskStatus.Canceled then
-                    Error (ChannelError "Channel send cancelled")
-                else Ok ()
+        return!
+            task {
+                try
+                    do! signal.Task.WaitAsync(ct)
+                    return Ok ()
+                with :? OperationCanceledException ->
+                    return Error (ChannelError "Channel send cancelled")
+            } |> Async.AwaitTask
     }
 
     // Handle CHANNEL_OPEN request
@@ -172,82 +180,91 @@ module Channel =
 
         match ChannelManager.getChannel manager recipientChannel with
         | None ->
-            if wantReply then
-                let failMsg = ChannelFailure(recipientChannel)
-                let! _ = Transport.sendMessage stream transportState failMsg
-                ()
+            // No valid remote channel exists for a failure reply.
             return Error (ChannelError $"Unknown channel: {recipientChannel}")
 
         | Some channel ->
-            let requestData = Packet.parseChannelRequest requestType data
+            let parsed =
+                try Ok (Packet.parseChannelRequest requestType data)
+                with :? ArgumentException as error -> Error (ProtocolError error.Message)
+            match parsed with
+            | Error error -> return Error error
+            | Ok requestData ->
+                let! success = async {
+                    match requestData with
+                    | PtyReq(term, widthChars, heightRows, _, _, _) ->
+                        let! result = callbacks.OnPtyRequest channel.LocalChannel term widthChars heightRows
+                        if result then
+                            ChannelManager.updateChannel manager recipientChannel (fun ch ->
+                                { ch with PtyRequested = true; PtyTerm = Some term }
+                            ) |> ignore
+                        return result
 
-            let! success = async {
-                match requestData with
-                | PtyReq(term, widthChars, heightRows, _, _, _) ->
-                    let! result = callbacks.OnPtyRequest channel.LocalChannel term widthChars heightRows
-                    if result then
-                        ChannelManager.updateChannel manager recipientChannel (fun ch ->
-                            { ch with PtyRequested = true; PtyTerm = Some term }
-                        ) |> ignore
-                    return result
+                    | Shell when not channel.ProgramStarted ->
+                        let! result = callbacks.OnShellRequest channel.LocalChannel
+                        if result then
+                            ChannelManager.updateChannel manager recipientChannel (fun ch -> { ch with ProgramStarted = true }) |> ignore
+                        return result
 
-                | Shell ->
-                    return! callbacks.OnShellRequest channel.LocalChannel
+                    | Exec(command) when not channel.ProgramStarted ->
+                        let! result = callbacks.OnExecRequest channel.LocalChannel command
+                        if result then
+                            ChannelManager.updateChannel manager recipientChannel (fun ch -> { ch with ProgramStarted = true }) |> ignore
+                        return result
 
-                | Exec(command) ->
-                    return! callbacks.OnExecRequest channel.LocalChannel command
+                    | WindowChange _ ->
+                        // Window change doesn't need a callback, just acknowledge
+                        return true
 
-                | WindowChange _ ->
-                    // Window change doesn't need a callback, just acknowledge
-                    return true
+                    | Signal _ ->
+                        // Signal handling could be added
+                        return true
 
-                | Signal _ ->
-                    // Signal handling could be added
-                    return true
+                    | _ ->
+                        return false
+                }
 
-                | _ ->
-                    return false
-            }
-
-            // Return success status and remote channel for caller to send reply
-            // Caller should use latest transport state to send the reply
-            return Ok (transportState, manager, success, if wantReply then Some channel.RemoteChannel else None)
+                // Caller sends the reply using its latest transport state.
+                return Ok (transportState, manager, success, if wantReply then Some channel.RemoteChannel else None)
     }
 
-    // Handle CHANNEL_DATA
+    /// Debit the shared receive window before delivering either data form.
+    let private debitInbound (manager: ChannelManager) recipientChannel (length: int) =
+        lock manager.Sync (fun () ->
+            match manager.Channels.TryGetValue recipientChannel with
+            | false, _ -> Error (ChannelError $"Unknown channel: {recipientChannel}")
+            | true, channel when length < 0 || uint64 length > uint64 channel.LocalWindowSize ||
+                                 uint64 length > uint64 channel.LocalMaxPacketSize ->
+                Error (ProtocolError "Channel data exceeds receive window or maximum packet size")
+            | true, channel ->
+                manager.Channels.[recipientChannel] <- { channel with LocalWindowSize = channel.LocalWindowSize - uint32 length }
+                Ok channel)
+
+    /// Validate and reserve receive credit for ordinary or extended data.
+    let receiveDataCredit manager recipientChannel length : SshResult<unit> =
+        debitInbound manager recipientChannel length |> Result.map ignore
+
     let handleChannelData
         (manager: ChannelManager)
         (callbacks: ChannelCallbacks)
         (recipientChannel: uint32)
         (data: byte[]) = async {
-
-        match ChannelManager.getChannel manager recipientChannel with
-        | None ->
-            return Error (ChannelError $"Unknown channel: {recipientChannel}")
-        | Some channel ->
-            // Update window size
-            let dataLen = uint32 data.Length
-            ChannelManager.updateChannel manager recipientChannel (fun ch ->
-                { ch with LocalWindowSize = ch.LocalWindowSize - dataLen }
-            ) |> ignore
-
-            // Notify callback
+        match debitInbound manager recipientChannel data.Length with
+        | Error e -> return Error e
+        | Ok channel ->
             do! callbacks.OnData channel.LocalChannel data
             return Ok manager
     }
 
-    // Handle CHANNEL_EXTENDED_DATA
     let handleChannelExtendedData
         (manager: ChannelManager)
         (callbacks: ChannelCallbacks)
         (recipientChannel: uint32)
         (dataTypeCode: uint32)
         (data: byte[]) = async {
-
-        match ChannelManager.getChannel manager recipientChannel with
-        | None ->
-            return Error (ChannelError $"Unknown channel: {recipientChannel}")
-        | Some channel ->
+        match debitInbound manager recipientChannel data.Length with
+        | Error e -> return Error e
+        | Ok channel ->
             do! callbacks.OnExtendedData channel.LocalChannel dataTypeCode data
             return Ok manager
     }

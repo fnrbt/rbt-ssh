@@ -92,8 +92,7 @@ module Session =
         let mutable position = 0
         let mutable failure : SshResult<unit> option = None
         while failure.IsNone && position < data.Length do
-            let pending = data.[position..]
-            match Channel.acquireOutboundCredit (!ctx).ChannelManager channelId pending with
+            match Channel.acquireOutboundCredit (!ctx).ChannelManager channelId data position with
             | Error e -> failure <- Some (Error e)
             | Ok (Channel.Waiting signal) ->
                 match! Channel.waitForCredit signal ct with
@@ -136,8 +135,7 @@ module Session =
         let mutable position = 0
         let mutable failure : SshResult<unit> option = None
         while failure.IsNone && position < data.Length do
-            let pending = data.[position..]
-            match Channel.acquireOutboundCredit (!ctx).ChannelManager channelId pending with
+            match Channel.acquireOutboundCredit (!ctx).ChannelManager channelId data position with
             | Error e -> failure <- Some (Error e)
             | Ok (Channel.Waiting signal) ->
                 match! Channel.waitForCredit signal ct with
@@ -198,6 +196,26 @@ module Session =
                             return Ok ()
             })
     }
+    /// Return receive credit only after application consumption.
+    let replenishInputRef
+        (stream: NetworkStream)
+        (ctx: SessionContext ref)
+        (locks: SessionLocks)
+        (channelId: uint32)
+        (bytes: uint32) = async {
+        if bytes = 0u then return Ok ()
+        else
+            return! withSendLock locks (fun () -> async {
+                let current = !ctx
+                let! result = Channel.sendWindowAdjust stream current.TransportState current.ChannelManager channelId bytes
+                match result with
+                | Error e -> return Error e
+                | Ok transport ->
+                    publishTransport ctx locks Transport.adoptWriteCursors transport
+                    return Ok ()
+            })
+    }
+
 
     let private handleMessageRef
         (stream: NetworkStream)
@@ -225,19 +243,22 @@ module Session =
             let! result =
                 withSendLock locks (fun () -> async {
                     let current = !ctx
-                    return!
+                    let! result =
                         Channel.handleChannelOpen
                             stream current.TransportState current.ChannelManager
                             channelType senderChannel initialWindowSize maximumPacketSize data
+                    match result with
+                    | Error e -> return Error e
+                    | Ok (transport, manager, _) ->
+                        publishContext ctx locks (fun latest ->
+                            { latest with
+                                TransportState = Transport.adoptWriteCursors latest.TransportState transport
+                                ChannelManager = manager })
+                        return Ok ()
                 })
             match result with
             | Error e -> return Error e, None
-            | Ok (transport, manager, _) ->
-                publishContext ctx locks (fun latest ->
-                    { latest with
-                        TransportState = Transport.adoptWriteCursors latest.TransportState transport
-                        ChannelManager = manager })
-                return Ok (), None
+            | Ok () -> return Ok (), None
 
         | ChannelRequest(recipientChannel, requestType, wantReply, data) ->
             let current = !ctx
@@ -264,22 +285,11 @@ module Session =
             | Error e -> return Error e, None
             | Ok manager ->
                 publishContext ctx locks (fun latest -> { latest with ChannelManager = manager })
-                let! adjustResult =
-                    withSendLock locks (fun () -> async {
-                        let latest = !ctx
-                        return!
-                            Channel.sendWindowAdjust
-                                stream
-                                latest.TransportState
-                                latest.ChannelManager
-                                recipientChannel
-                                (uint32 data.Length)
-                    })
-                match adjustResult with
-                | Error e -> return Error e, None
-                | Ok transport ->
-                    publishTransport ctx locks Transport.adoptWriteCursors transport
-                    return Ok (), None
+                let deferred = lock manager.Sync (fun () -> manager.DeferredInput.Contains recipientChannel)
+                if deferred then return Ok (), None
+                else
+                    let! adjusted = replenishInputRef stream ctx locks recipientChannel (uint32 data.Length)
+                    return adjusted, None
 
         | ChannelExtendedData(recipientChannel, dataTypeCode, data) ->
             let current = !ctx
@@ -288,7 +298,8 @@ module Session =
             | Error e -> return Error e, None
             | Ok manager ->
                 publishContext ctx locks (fun latest -> { latest with ChannelManager = manager })
-                return Ok (), None
+                let! adjusted = replenishInputRef stream ctx locks recipientChannel (uint32 data.Length)
+                return adjusted, None
 
         | ChannelEof(recipientChannel) ->
             let current = !ctx
@@ -303,16 +314,19 @@ module Session =
             let! result =
                 withSendLock locks (fun () -> async {
                     let current = !ctx
-                    return! Channel.handleChannelClose stream current.TransportState current.ChannelManager channelCallbacks recipientChannel
+                    let! result = Channel.handleChannelClose stream current.TransportState current.ChannelManager channelCallbacks recipientChannel
+                    match result with
+                    | Error e -> return Error e
+                    | Ok (transport, manager) ->
+                        publishContext ctx locks (fun latest ->
+                            { latest with
+                                TransportState = Transport.adoptWriteCursors latest.TransportState transport
+                                ChannelManager = manager })
+                        return Ok ()
                 })
             match result with
             | Error e -> return Error e, None
-            | Ok (transport, manager) ->
-                publishContext ctx locks (fun latest ->
-                    { latest with
-                        TransportState = Transport.adoptWriteCursors latest.TransportState transport
-                        ChannelManager = manager })
-                return Ok (), None
+            | Ok () -> return Ok (), None
 
         | ChannelWindowAdjust(recipientChannel, bytesToAdd) ->
             let current = !ctx
@@ -337,11 +351,12 @@ module Session =
             return sent, None
     }
 
-    let runMessageLoopRef
+    let private runMessageLoopWithTimeout
         (stream: NetworkStream)
         (ctx: SessionContext ref)
         (locks: SessionLocks)
-        (channelCallbacks: ChannelCallbacks) = async {
+        (channelCallbacks: ChannelCallbacks)
+        (idleTimeout: (CancellationTokenSource * TimeSpan) option) = async {
 
         let rec loop () = async {
             let current = !ctx
@@ -352,6 +367,9 @@ module Session =
                 match received with
                 | Error e -> return Error e
                 | Ok (msg, transportAfterReceive) ->
+                    match idleTimeout with
+                    | Some (timer, timeout) -> timer.CancelAfter(timeout)
+                    | None -> ()
                     publishTransport ctx locks Transport.adoptReadCursors transportAfterReceive
                     let! handled = handleMessageRef stream ctx locks msg channelCallbacks
                     match handled with
@@ -362,6 +380,9 @@ module Session =
 
         return! loop ()
     }
+    let runMessageLoopRef stream ctx locks channelCallbacks =
+        runMessageLoopWithTimeout stream ctx locks channelCallbacks None
+
 
     let runMessageLoop
         (stream: NetworkStream)
@@ -373,12 +394,12 @@ module Session =
         return! runMessageLoopRef stream ctxRef locks channelCallbacks
     }
 
-    let runSessionWithFactory
+    let private runSessionCore
         (stream: NetworkStream)
         (config: ServerConfig)
         (authCallbacks: AuthCallbacks)
-        (channelFactory: ChannelCallbackFactory) = async {
-
+        (channelFactory: ChannelCallbackFactory)
+        (deadline: CancellationTokenSource) = async {
         let ctx = create config.ServerVersion
 
         let! versionResult = Transport.exchangeVersions stream config.ServerVersion
@@ -425,7 +446,30 @@ module Session =
                                 Username = authState.Username
                         }
                         let channelCallbacks = channelFactory stream ctxRef locks authState
-                        return! runMessageLoopRef stream ctxRef locks channelCallbacks
+                        deadline.CancelAfter(config.IdleTimeout)
+                        return! runMessageLoopWithTimeout stream ctxRef locks channelCallbacks (Some (deadline, config.IdleTimeout))
+    }
+
+    /// Enforce the authentication deadline from version exchange and the idle
+    /// deadline after authentication, including time spent in callbacks.
+    let runSessionWithFactory
+        (stream: NetworkStream)
+        (config: ServerConfig)
+        (authCallbacks: AuthCallbacks)
+        (channelFactory: ChannelCallbackFactory) = async {
+        let! cancellation = Async.CancellationToken
+        use deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation)
+        use registration = deadline.Token.Register(fun () -> stream.Dispose())
+        deadline.CancelAfter(config.AuthTimeout)
+        return!
+            task {
+                try
+                    return! Async.StartAsTask(
+                        runSessionCore stream config authCallbacks channelFactory deadline,
+                        cancellationToken = deadline.Token)
+                with :? OperationCanceledException ->
+                    return Error (ConnectionError "Session timed out or was cancelled")
+            } |> Async.AwaitTask
     }
 
     let runSession
@@ -463,8 +507,7 @@ module Session =
         let mutable position = 0
         let mutable failure : SshResult<unit> option = None
         while failure.IsNone && position < data.Length do
-            let pending = data.[position..]
-            match Channel.acquireOutboundCredit ctx.ChannelManager channelId pending with
+            match Channel.acquireOutboundCredit ctx.ChannelManager channelId data position with
             | Error e -> failure <- Some (Error e)
             | Ok (Channel.Waiting signal) ->
                 match! Channel.waitForCredit signal CancellationToken.None with

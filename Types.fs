@@ -238,6 +238,8 @@ type ChannelState = {
     ChannelType: string
     IsClosed: bool
     IsEof: bool
+    /// Whether a shell or exec request has already succeeded.
+    ProgramStarted: bool
     PtyRequested: bool
     PtyTerm: string option
     /// Completed when the peer grants more outbound window credit. A sender
@@ -258,6 +260,7 @@ module ChannelState =
         ChannelType = channelType
         IsClosed = false
         IsEof = false
+        ProgramStarted = false
         PtyRequested = false
         PtyTerm = None
         WindowSignal =
@@ -297,6 +300,7 @@ type ClientConfig = {
     ClientVersion: string
     Username: string
     ConnectTimeout: TimeSpan
+    /// Explicitly configure trusted fingerprints or a custom verifier. The default rejects all host keys.
     HostKeyVerification: HostKeyVerification
 }
 
@@ -305,7 +309,7 @@ module ClientConfig =
         ClientVersion = "SSH-2.0-FSharpSSH_1.0"
         Username = ""
         ConnectTimeout = TimeSpan.FromSeconds(30.0)
-        HostKeyVerification = AcceptAll
+        HostKeyVerification = Fingerprint []
     }
 
 /// SSH error types
@@ -326,7 +330,9 @@ type ServerConfig = {
     ServerVersion: string
     ListenPort: int
     MaxAuthAttempts: int
+    /// Deadline from connection establishment through successful authentication.
     AuthTimeout: TimeSpan
+    /// Maximum time between received messages after authentication.
     IdleTimeout: TimeSpan
 }
 

@@ -4,374 +4,171 @@ open System
 open System.Text
 open System.Net.Sockets
 open System.Collections.Concurrent
+open System.Threading
 open Rbt.Ssh
 
-// Rot13 transformation
 let rot13 (s: string) =
     s |> String.map (fun c ->
         match c with
         | c when c >= 'a' && c <= 'z' -> char ((int c - int 'a' + 13) % 26 + int 'a')
         | c when c >= 'A' && c <= 'Z' -> char ((int c - int 'A' + 13) % 26 + int 'A')
-        | _ -> c
-    )
+        | _ -> c)
 
-// Channel state for rot13 shell
-type ShellState = {
-    Buffer: StringBuilder
-    Stream: NetworkStream
-    Context: SessionContext ref
-    LocalChannel: uint32
-}
-
-// Active shells
-let activeShells = ConcurrentDictionary<uint32, ShellState>()
-
-// Send data to a channel
-let sendToChannel (state: ShellState) (data: string) = async {
-    let bytes = Encoding.UTF8.GetBytes(data)
-    let ctx = !state.Context
-    match Channel.ChannelManager.getChannel ctx.ChannelManager state.LocalChannel with
-    | Some channel ->
-        let dataMsg = ChannelData(channel.RemoteChannel, bytes)
-        let! result = Transport.sendMessage state.Stream ctx.TransportState dataMsg
-        match result with
-        | Ok newTransportState ->
-            state.Context := { ctx with TransportState = newTransportState }
-        | Error _ -> ()
-    | None -> ()
-}
-
-// Send prompt
-let sendPrompt state = async {
-    do! sendToChannel state "rot13> "
-}
-
-// Process a line of input
-let processLine (state: ShellState) (line: string) = async {
-    let trimmed = line.TrimEnd([| '\r'; '\n' |])
-    if trimmed = "exit" || trimmed = "quit" then
-        do! sendToChannel state "Goodbye!\r\n"
-        // Close the channel
-        let ctx = !state.Context
-        match Channel.ChannelManager.getChannel ctx.ChannelManager state.LocalChannel with
-        | Some _channel ->
-            // Send exit status - update context after each send
-            let! statusResult = Channel.sendExitStatus state.Stream ctx.TransportState ctx.ChannelManager state.LocalChannel 0u
-            match statusResult with
-            | Ok newTransport -> state.Context := { !state.Context with TransportState = newTransport }
-            | Error _ -> ()
-
-            // Send EOF
-            let ctx2 = !state.Context
-            let! eofResult = Channel.sendChannelEof state.Stream ctx2.TransportState ctx2.ChannelManager state.LocalChannel
-            match eofResult with
-            | Ok newTransport -> state.Context := { !state.Context with TransportState = newTransport }
-            | Error _ -> ()
-
-            // Close channel
-            let ctx3 = !state.Context
-            let! closeResult = Channel.closeChannel state.Stream ctx3.TransportState ctx3.ChannelManager state.LocalChannel
-            match closeResult with
-            | Ok newTransport -> state.Context := { !state.Context with TransportState = newTransport }
-            | Error _ -> ()
-        | None -> ()
-    else
-        let result = rot13 trimmed
-        do! sendToChannel state (result + "\r\n")
-        do! sendPrompt state
-}
-
-// Handle incoming data
-let handleData (channelId: uint32) (data: byte[]) = async {
-    match activeShells.TryGetValue(channelId) with
-    | true, state ->
-        let text = Encoding.UTF8.GetString(data)
-
-        // Echo the input back (for terminal)
-        do! sendToChannel state text
-
-        for c in text do
-            if c = '\r' || c = '\n' then
-                let line = state.Buffer.ToString()
-                state.Buffer.Clear() |> ignore
-                if line.Length > 0 then
-                    do! sendToChannel state "\r\n"
-                    do! processLine state line
-            elif c = '\x7f' || c = '\b' then  // Backspace/DEL
-                if state.Buffer.Length > 0 then
-                    state.Buffer.Remove(state.Buffer.Length - 1, 1) |> ignore
-                    // Send backspace sequence to terminal
-                    do! sendToChannel state "\b \b"
-            elif c = '\x03' then  // Ctrl+C
-                do! sendToChannel state "^C\r\n"
-                do! sendPrompt state
-                state.Buffer.Clear() |> ignore
-            elif c >= ' ' then
-                state.Buffer.Append(c) |> ignore
-    | false, _ -> ()
-}
-
-// Run the server with a custom session handler
+// Each connection has its own channel namespace and serialized transport.
 let runServer () =
     let hostKey = Crypto.createEd25519HostKey()
-
-    let config = {
-        ServerConfig.defaults with
-            ListenPort = 2222
-            HostKeys = [ hostKey ]
+    let config = { ServerConfig.defaults with ListenPort = 2222; HostKeys = [ hostKey ] }
+    let auth = {
+        ValidatePassword = fun _ _ -> async { return Accepted }
+        ValidatePublicKey = fun _ _ _ -> async { return Rejected }
     }
-
-    printfn "SSH Rot13 Server"
-    printfn "================"
-    printfn "Listening on port 2222"
-    printfn "Connect with: ssh -o StrictHostKeyChecking=no -p 2222 user@localhost"
-    printfn "Any username/password will work"
-    printfn ""
-
-    let listener = new TcpListener(System.Net.IPAddress.Any, 2222)
+    let listener = new TcpListener(System.Net.IPAddress.Any, config.ListenPort)
     listener.Start()
-
-    let rec acceptLoop () = async {
-        let! client = listener.AcceptTcpClientAsync() |> Async.AwaitTask
-        printfn "New connection from %s" (client.Client.RemoteEndPoint.ToString())
-
-        // Handle client in background
-        Async.Start(handleClient client)
-
-        return! acceptLoop ()
-    }
-
-    and handleClient (client: TcpClient) = async {
+    printfn "SSH Rot13 Server listening on port %d" config.ListenPort
+    printfn "Host key fingerprint: %s" (PrivateKeyFile.fingerprint hostKey.PublicKeyBlob)
+    let handleClient (client: TcpClient) = async {
         use client = client
         use stream = client.GetStream()
-
-        try
-            // Version exchange
-            let! versionResult = Transport.exchangeVersions stream config.ServerVersion
-            match versionResult with
-            | Error e ->
-                printfn "Version exchange failed: %A" e
-            | Ok clientVersion ->
-                printfn "Client version: %s" clientVersion
-
-                let transportState = {
-                    TransportState.create config.ServerVersion with
-                        ClientVersion = Some clientVersion
+        use sessionCts = new CancellationTokenSource()
+        let factory stream ctx locks _ =
+            // Queued input is bounded by the SSH receive window. The worker
+            // returns credit only after it has processed each chunk, so it can
+            // wait for outbound credit without blocking WINDOW_ADJUST handling.
+            let shells = ConcurrentDictionary<uint32, System.Threading.Channels.Channel<byte[]>>()
+            sessionCts.Token.Register(fun () ->
+                for input in shells.Values do input.Writer.TryComplete() |> ignore) |> ignore
+            let send id (text: string) = async {
+                match! Session.sendDataRef stream ctx locks id (Encoding.UTF8.GetBytes text) sessionCts.Token with
+                | Ok () -> ()
+                | Error error -> failwithf "Shell send failed: %A" error
+            }
+            let close id = async {
+                let! _ = Session.closeChannelWithStatusRef stream ctx locks id 0u
+                return ()
+            }
+            let startShell id =
+                let input = System.Threading.Channels.Channel.CreateUnbounded<byte[]>()
+                shells.[id] <- input
+                let manager = (!ctx).ChannelManager
+                lock manager.Sync (fun () -> manager.DeferredInput.Add(id) |> ignore)
+                let run = async {
+                    let buffer = StringBuilder()
+                    let mutable running = true
+                    let prompt () = send id "rot13> "
+                    let processLine (line: string) = async {
+                        let trimmed = line.TrimEnd([| '\r'; '\n' |])
+                        if trimmed = "exit" || trimmed = "quit" then
+                            do! send id "Goodbye!\r\n"
+                            do! close id
+                            running <- false
+                        else
+                            do! send id (rot13 trimmed + "\r\n")
+                            do! prompt ()
+                    }
+                    try
+                        do! send id "Welcome to the Rot13 Shell!\r\n"
+                        do! send id "Type text and press Enter to see it rot13'd.\r\n"
+                        do! send id "Type 'exit' or 'quit' to disconnect.\r\n"
+                        do! send id "\r\n"
+                        do! prompt ()
+                        while running do
+                            let! available = input.Reader.WaitToReadAsync(sessionCts.Token).AsTask() |> Async.AwaitTask
+                            if not available then running <- false
+                            else
+                                let mutable data = Unchecked.defaultof<byte[]>
+                                if input.Reader.TryRead(&data) then
+                                    let text = Encoding.UTF8.GetString(data)
+                                    do! send id text
+                                    for c in text do
+                                        if not running then ()
+                                        elif c = '\r' || c = '\n' then
+                                            let line = buffer.ToString()
+                                            buffer.Clear() |> ignore
+                                            if line.Length > 0 then
+                                                do! send id "\r\n"
+                                                do! processLine line
+                                        elif c = '\x7f' || c = '\b' then
+                                            if buffer.Length > 0 then
+                                                buffer.Remove(buffer.Length - 1, 1) |> ignore
+                                                do! send id "\b \b"
+                                        elif c = '\x03' then
+                                            do! send id "^C\r\n"
+                                            do! prompt ()
+                                            buffer.Clear() |> ignore
+                                        elif c >= ' ' then
+                                            buffer.Append(c) |> ignore
+                                    if running then
+                                        match! Session.replenishInputRef stream ctx locks id (uint32 data.Length) with
+                                        | Ok () -> ()
+                                        | Error _ -> running <- false
+                    with
+                    | :? OperationCanceledException -> ()
+                    | ex -> printfn "Shell error: %s" ex.Message
                 }
-
-                // Key exchange
-                let! kexResult = KeyExchange.handleKeyExchange stream transportState config.HostKeys
-                match kexResult with
-                | Error e ->
-                    printfn "Key exchange failed: %A" e
-                | Ok (transportAfterKex, kexState, _) ->
-                    printfn "Key exchange complete"
-
-                    match kexState.SessionId with
-                    | None ->
-                        printfn "No session ID"
-                    | Some sessionId ->
-                        // Authentication
-                        let authCallbacks = {
-                            ValidatePassword = fun user _password -> async {
-                                printfn "Password auth for user: %s" user
-                                return Accepted
-                            }
-                            ValidatePublicKey = fun _user _alg _key -> async {
-                                return Rejected
-                            }
-                        }
-
-                        let! authResult = Auth.runAuthLoop stream transportAfterKex sessionId authCallbacks 10
-                        match authResult with
-                        | Error e ->
-                            printfn "Auth failed: %A" e
-                        | Ok (transportAfterAuth, authState) ->
-                            printfn "User authenticated: %s" (authState.Username |> Option.defaultValue "unknown")
-
-                            // Create session context
-                            let ctx = ref {
-                                TransportState = transportAfterAuth
-                                KexState = kexState
-                                ChannelManager = Channel.ChannelManager.create()
-                                AuthState = Some authState
-                                State = SessionState.Authenticated
-                                Username = authState.Username
-                            }
-
-                            // Channel callbacks
-                            let channelCallbacks = {
-                                OnData = handleData
-                                OnExtendedData = fun _ _ _ -> async { () }
-                                OnEof = fun channelId -> async {
-                                    printfn "EOF on channel %d" channelId
-                                    activeShells.TryRemove(channelId) |> ignore
-                                }
-                                OnClose = fun channelId -> async {
-                                    printfn "Channel %d closed" channelId
-                                    activeShells.TryRemove(channelId) |> ignore
-                                }
-                                OnPtyRequest = fun channelId term _ _ -> async {
-                                    printfn "PTY request on channel %d: %s" channelId term
-                                    return true
-                                }
-                                OnShellRequest = fun channelId -> async {
-                                    printfn "Shell request on channel %d" channelId
-
-                                    // Create shell state
-                                    let shellState = {
-                                        Buffer = StringBuilder()
-                                        Stream = stream
-                                        Context = ctx
-                                        LocalChannel = channelId
-                                    }
-                                    activeShells.[channelId] <- shellState
-
-                                    // Send welcome and prompt
-                                    do! sendToChannel shellState "Welcome to the Rot13 Shell!\r\n"
-                                    do! sendToChannel shellState "Type text and press Enter to see it rot13'd.\r\n"
-                                    do! sendToChannel shellState "Type 'exit' or 'quit' to disconnect.\r\n"
-                                    do! sendToChannel shellState "\r\n"
-                                    do! sendPrompt shellState
-
-                                    return true
-                                }
-                                OnExecRequest = fun channelId command -> async {
-                                    printfn "Exec request on channel %d: %s" channelId command
-
-                                    // Just rot13 the command and return
-                                    let result = rot13 command
-                                    let currentCtx = !ctx
-                                    match Channel.ChannelManager.getChannel currentCtx.ChannelManager channelId with
-                                    | Some channel ->
-                                        let bytes = Encoding.UTF8.GetBytes(result + "\n")
-                                        let dataMsg = ChannelData(channel.RemoteChannel, bytes)
-                                        let! sendResult = Transport.sendMessage stream currentCtx.TransportState dataMsg
-                                        match sendResult with
-                                        | Ok newTransport -> ctx := { !ctx with TransportState = newTransport }
-                                        | Error _ -> ()
-
-                                        // Send exit status and close - update ctx after each send
-                                        let! statusResult = Channel.sendExitStatus stream (!ctx).TransportState (!ctx).ChannelManager channelId 0u
-                                        match statusResult with
-                                        | Ok newTransport -> ctx := { !ctx with TransportState = newTransport }
-                                        | Error _ -> ()
-
-                                        let! eofResult = Channel.sendChannelEof stream (!ctx).TransportState (!ctx).ChannelManager channelId
-                                        match eofResult with
-                                        | Ok newTransport -> ctx := { !ctx with TransportState = newTransport }
-                                        | Error _ -> ()
-
-                                        let! closeResult = Channel.closeChannel stream (!ctx).TransportState (!ctx).ChannelManager channelId
-                                        match closeResult with
-                                        | Ok newTransport -> ctx := { !ctx with TransportState = newTransport }
-                                        | Error _ -> ()
-                                    | None -> ()
-
-                                    return true
-                                }
-                            }
-
-                            // Message loop
-                            let rec messageLoop () = async {
-                                let currentCtx = !ctx
-                                if currentCtx.State = SessionState.Disconnected then
-                                    return ()
-                                else
-                                    try
-                                        let! result = Transport.receiveMessage stream currentCtx.TransportState
-                                        match result with
-                                        | Error e ->
-                                            printfn "Receive error: %A" e
-                                        | Ok (msg, newTransportState) ->
-                                            // Merge transport state: keep server->client state from current ctx,
-                                            // update client->server state from receive result
-                                            let latestCtx = !ctx
-                                            let mergedTransport = {
-                                                newTransportState with
-                                                    ServerToClientSequence = latestCtx.TransportState.ServerToClientSequence
-                                                    ServerToClientIV = latestCtx.TransportState.ServerToClientIV
-                                            }
-                                            ctx := { latestCtx with TransportState = mergedTransport }
-
-                                            match msg with
-                                            | Disconnect(_, desc, _) ->
-                                                printfn "Client disconnected: %s" desc
-                                                ctx := { !ctx with State = SessionState.Disconnected }
-
-                                            | ChannelOpen(channelType, senderChannel, initialWindowSize, maxPacketSize, data) ->
-                                                let currentCtx = !ctx
-                                                let! result = Channel.handleChannelOpen
-                                                                stream currentCtx.TransportState currentCtx.ChannelManager
-                                                                channelType senderChannel initialWindowSize maxPacketSize data
-                                                match result with
-                                                | Ok (newTransport, newManager, _) ->
-                                                    ctx := { !ctx with TransportState = newTransport; ChannelManager = newManager }
-                                                | Error e ->
-                                                    printfn "Channel open error: %A" e
-
-                                            | ChannelRequest(recipientChannel, requestType, wantReply, data) ->
-                                                let currentCtx = !ctx
-                                                let! result = Channel.handleChannelRequest
-                                                                stream currentCtx.TransportState currentCtx.ChannelManager
-                                                                channelCallbacks recipientChannel requestType wantReply data
-                                                match result with
-                                                | Ok (_, newManager, success, replyChannelOpt) ->
-                                                    ctx := { !ctx with ChannelManager = newManager }
-                                                    // Send reply with LATEST transport state (after callbacks may have sent data)
-                                                    match replyChannelOpt with
-                                                    | Some remoteChannel ->
-                                                        let latestCtx = !ctx
-                                                        let replyMsg = if success then ChannelSuccess(remoteChannel) else ChannelFailure(remoteChannel)
-                                                        let! sendResult = Transport.sendMessage stream latestCtx.TransportState replyMsg
-                                                        match sendResult with
-                                                        | Ok newTransport -> ctx := { !ctx with TransportState = newTransport }
-                                                        | Error _ -> ()
-                                                    | None -> ()
-                                                | Error e ->
-                                                    printfn "Channel request error: %A" e
-
-                                            | ChannelData(recipientChannel, data) ->
-                                                do! channelCallbacks.OnData recipientChannel data
-
-                                            | ChannelEof(recipientChannel) ->
-                                                do! channelCallbacks.OnEof recipientChannel
-
-                                            | ChannelClose(recipientChannel) ->
-                                                let currentCtx = !ctx
-                                                let! _ = Channel.handleChannelClose
-                                                            stream currentCtx.TransportState currentCtx.ChannelManager
-                                                            channelCallbacks recipientChannel
-                                                do! channelCallbacks.OnClose recipientChannel
-
-                                            | ChannelWindowAdjust(recipientChannel, bytesToAdd) ->
-                                                let currentCtx = !ctx
-                                                Channel.handleWindowAdjust currentCtx.ChannelManager recipientChannel bytesToAdd |> ignore
-
-                                            | _ ->
-                                                ()
-
-                                            return! messageLoop ()
-                                    with
-                                    | ex ->
-                                        printfn "Exception: %s" ex.Message
-                            }
-
-                            do! messageLoop ()
-                            printfn "Session ended"
-        with
-        | ex ->
-            printfn "Client handler exception: %s" ex.Message
+                Async.Start(async {
+                    try
+                        do! run
+                    finally
+                        input.Writer.TryComplete() |> ignore
+                        shells.TryRemove(id) |> ignore
+                }, sessionCts.Token)
+            {
+                OnData = fun id data -> async {
+                    match shells.TryGetValue id with
+                    | true, input when data.Length > 0 -> input.Writer.TryWrite(data) |> ignore
+                    | _ -> ()
+                }
+                OnExtendedData = fun _ _ _ -> async { () }
+                OnEof = fun id -> async {
+                    match shells.TryGetValue id with
+                    | true, input -> input.Writer.TryComplete() |> ignore
+                    | _ -> ()
+                }
+                OnClose = fun id -> async {
+                    match shells.TryRemove id with
+                    | true, input -> input.Writer.TryComplete() |> ignore
+                    | _ -> ()
+                }
+                OnPtyRequest = fun _ _ _ _ -> async { return true }
+                OnShellRequest = fun id -> async {
+                    startShell id
+                    return true
+                }
+                OnExecRequest = fun id command -> async {
+                    // Do not wait for remote output credit on the message loop.
+                    Async.Start(async {
+                        try
+                            do! send id (rot13 command + "\n")
+                            do! close id
+                        with
+                        | :? OperationCanceledException -> ()
+                        | ex -> printfn "Exec error: %s" ex.Message
+                    }, sessionCts.Token)
+                    return true
+                }
+            }
+        try
+            let! result = Session.runSessionWithFactory stream config auth factory
+            match result with
+            | Error error -> printfn "Session error: %A" error
+            | Ok _ -> ()
+        finally
+            sessionCts.Cancel()
     }
+    let rec accept () = async {
+        let! client = listener.AcceptTcpClientAsync() |> Async.AwaitTask
+        Async.Start(handleClient client)
+        return! accept ()
+    }
+    Async.RunSynchronously(accept ())
 
-    Async.RunSynchronously(acceptLoop ())
 
 // Run a client that connects and executes a command
-let runClient (host: string) (port: int) (username: string) (password: string) (command: string) =
+let runClient (host: string) (port: int) (username: string) (password: string) (fingerprint: string) (command: string) =
     let config = {
         ClientConfig.defaults with
             Username = username
-            HostKeyVerification = AcceptAll
+            HostKeyVerification = Fingerprint [ fingerprint ]
     }
     let authConfig: ClientAuth.ClientAuthConfig = {
         Username = username
@@ -404,12 +201,12 @@ let runClient (host: string) (port: int) (username: string) (password: string) (
 [<EntryPoint>]
 let main args =
     match args |> Array.toList with
-    | "client" :: host :: port :: user :: pass :: command ->
+    | "client" :: host :: port :: user :: pass :: fingerprint :: command when not command.IsEmpty ->
         let cmd = String.concat " " command
-        runClient host (int port) user pass cmd
+        runClient host (int port) user pass fingerprint cmd
+    | [] -> runServer ()
     | _ ->
         printfn "Usage:"
         printfn "  Server: dotnet run"
-        printfn "  Client: dotnet run -- client <host> <port> <user> <password> <command...>"
-        runServer ()
+        printfn "  Client: dotnet run -- client <host> <port> <user> <password> <host-fingerprint> <command...>"
     0

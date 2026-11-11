@@ -4,6 +4,16 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PackageReleaseNotes>
+      Host keys now require explicit trust; the CLI requires a host fingerprint.
+      Transport cursors are synchronized, handshake and idle deadlines are enforced,
+      and exec input is bounded by consumption-driven channel credit.
+      Fixes cover channel cancellation, early output, exit status and error propagation,
+      authentication fallback and banners, canonical key derivation, signature algorithm
+      enforcement, exact KEX transcripts and optimistic guesses, and packet validation.
+      API changes: SshClient requires ClientRuntime.create(); signature verification
+      requires the expected algorithm; outbound credit reservation requires a buffer offset.
+    </PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>

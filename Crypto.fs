@@ -145,25 +145,28 @@ module Crypto =
         RandomNumberGenerator.Fill(Span(bytes))
         bytes
 
+    /// Encode a non-negative big-endian integer as a canonical SSH mpint.
+    let encodePositiveMpint (value: byte[]) =
+        let mutable start = 0
+        while start < value.Length && value.[start] = 0uy do
+            start <- start + 1
+        let padding = start < value.Length && (value.[start] &&& 0x80uy) <> 0uy
+        let length = value.Length - start + (if padding then 1 else 0)
+        let encoded = Array.zeroCreate<byte> (4 + length)
+        encoded.[0] <- byte (length >>> 24)
+        encoded.[1] <- byte (length >>> 16)
+        encoded.[2] <- byte (length >>> 8)
+        encoded.[3] <- byte length
+        Array.Copy(value, start, encoded, 4 + (if padding then 1 else 0), value.Length - start)
+        encoded
+
     // SSH key derivation (RFC 4253 section 7.2)
     // K || H || X || session_id, where X is a single character
     let deriveKey (sharedSecret: byte[]) (exchangeHash: byte[]) (sessionId: byte[]) (keyChar: char) (keyLength: int) =
         // Build the hash input: K (mpint) || H || char || session_id
         // For SSH, K is encoded as mpint
-        let kMpint =
-            // SSH mpint: if MSB is set, prepend 0x00
-            let needsPadding = sharedSecret.Length > 0 && (sharedSecret.[0] &&& 0x80uy) <> 0uy
-            if needsPadding then
-                Array.concat [| [| 0uy |]; sharedSecret |]
-            else
-                sharedSecret
-
-        let kLenBytes = BitConverter.GetBytes(uint32 kMpint.Length)
-        if BitConverter.IsLittleEndian then
-            Array.Reverse(kLenBytes)
-
+        let kMpint = encodePositiveMpint sharedSecret
         let baseInput = Array.concat [|
-            kLenBytes
             kMpint
             exchangeHash
             [| byte keyChar |]
@@ -175,7 +178,6 @@ module Crypto =
         // If we need more bytes, keep hashing K || H || K1 || K2 || ...
         while key.Length < keyLength do
             let extendInput = Array.concat [|
-                kLenBytes
                 kMpint
                 exchangeHash
                 key
@@ -328,10 +330,13 @@ module Crypto =
                 let remainder = blob.[4 + algorithmNameLen..]
                 Option.Some(algorithmName, remainder)
 
-    // Verify a public key signature
-    let verifyPublicKeySignature (publicKeyBlob: byte[]) (signatureBlob: byte[]) (data: byte[]) =
+    /// Verify a signature only when its algorithm matches the negotiated or requested algorithm.
+    let verifyPublicKeySignature (expectedAlgorithm: string) (publicKeyBlob: byte[]) (signatureBlob: byte[]) (data: byte[]) =
         match parsePublicKeyBlob publicKeyBlob, parsePublicKeyBlob signatureBlob with
-        | Option.Some(keyAlg, keyData), Option.Some(sigAlg, sigData) ->
+        | Option.Some(keyAlg, keyData), Option.Some(sigAlg, sigData)
+            when sigAlg = expectedAlgorithm &&
+                 ((keyAlg = "ssh-ed25519" && sigAlg = "ssh-ed25519") ||
+                  (keyAlg = "ssh-rsa" && (sigAlg = "ssh-rsa" || sigAlg = "rsa-sha2-256" || sigAlg = "rsa-sha2-512"))) ->
             // Extract actual signature from sigData (it's length-prefixed)
             if sigData.Length < 4 then
                 false

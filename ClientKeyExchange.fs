@@ -38,7 +38,8 @@ module ClientKeyExchange =
         (stream: NetworkStream)
         (transportState: TransportState)
         (kexState: KexState)
-        (hostKeyVerification: HostKeyVerification) = async {
+        (hostKeyVerification: HostKeyVerification)
+        (negotiatedHostKeyAlg: string) = async {
 
         // Generate client ephemeral key pair
         let (clientEphemeralPublic, clientEphemeralPrivate) = Crypto.generateCurve25519KeyPair()
@@ -79,7 +80,7 @@ module ClientKeyExchange =
                                                     sharedSecret
 
                                 // Verify the server's signature over the exchange hash
-                                if not (Crypto.verifyPublicKeySignature hostKeyBlob signature exchangeHash) then
+                                if not (Crypto.verifyPublicKeySignature negotiatedHostKeyAlg hostKeyBlob signature exchangeHash) then
                                     return Error (CryptoError "Exchange hash signature verification failed")
                                 else
                                     let sessionId =
@@ -135,18 +136,16 @@ module ClientKeyExchange =
         | Error e -> return Error e
         | Ok stateAfterKexInit ->
             // Receive server KEXINIT
-            let! recvResult = Transport.receiveMessage stream stateAfterKexInit
+            let! recvResult = Transport.receiveMessageWithPayload stream stateAfterKexInit
             match recvResult with
             | Error e -> return Error e
-            | Ok (serverMsg, stateAfterServerKexInit) ->
+            | Ok (serverMsg, serverKexPayload, stateAfterServerKexInit) ->
                 match serverMsg with
                 | KexInit _ as serverKexInit ->
-                    let serverKexPayload = Packet.buildMessagePayload serverKexInit
-
                     // Negotiate algorithms (client's list is checked first per RFC 4253)
                     match KeyExchange.negotiateAlgorithms clientKexInit serverKexInit with
                     | Error e -> return Error e
-                    | Ok (kexAlg, _hostKeyAlg, _, _, _, _, _, _) ->
+                    | Ok (kexAlg, hostKeyAlg, _, _, _, _, _, _) ->
                         if kexAlg <> Algorithms.KEX_CURVE25519_SHA256 &&
                            kexAlg <> Algorithms.KEX_CURVE25519_SHA256_LIBSSH then
                             return Error (ProtocolError $"Unsupported KEX algorithm: {kexAlg}")
@@ -156,7 +155,14 @@ module ClientKeyExchange =
                                     ClientKexInit = Some clientKexPayload
                                     ServerKexInit = Some serverKexPayload
                             }
-                            return! performKeyExchange stream stateAfterServerKexInit kexState hostKeyVerification
+                            if KeyExchange.incorrectGuess serverKexInit kexAlg hostKeyAlg then
+                                let! ignored = Transport.readPacket stream stateAfterServerKexInit
+                                match ignored with
+                                | Error e -> return Error e
+                                | Ok (_, stateAfterGuess) ->
+                                    return! performKeyExchange stream stateAfterGuess kexState hostKeyVerification hostKeyAlg
+                            else
+                                return! performKeyExchange stream stateAfterServerKexInit kexState hostKeyVerification hostKeyAlg
                 | _ ->
                     return Error (ProtocolError "Expected KEXINIT from server")
     }

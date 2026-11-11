@@ -1,9 +1,11 @@
 namespace Rbt.Ssh
 
 open System
+open System.Collections.Generic
 open System.Net.Sockets
 open System.Threading
 
+/// Connection-protocol state shared by the independent reader and writers.
 type ClientContext = {
     TransportState: TransportState
     KexState: KexState
@@ -12,10 +14,31 @@ type ClientContext = {
     Username: string
 }
 
+type ClientRuntime = {
+    /// Serializes complete packet writes, including their outbound cursor publication.
+    SendGate: SemaphoreSlim
+    /// Only one reader may consume a reply or an incoming packet at a time.
+    ReceiveGate: SemaphoreSlim
+    ContextSync: obj
+    /// True when credit was returned during a request-reply wait.
+    PendingMessages: Queue<SshMessage * bool>
+    Closed: CancellationTokenSource
+}
+
+module ClientRuntime =
+    let create () = {
+        SendGate = new SemaphoreSlim(1, 1)
+        ReceiveGate = new SemaphoreSlim(1, 1)
+        ContextSync = obj ()
+        PendingMessages = Queue<SshMessage * bool>()
+        Closed = new CancellationTokenSource()
+    }
+
 type SshClient = {
     TcpClient: TcpClient
     Stream: NetworkStream
     Context: ClientContext ref
+    Runtime: ClientRuntime
 }
 
 /// Callbacks for receiving data from the server
@@ -28,374 +51,427 @@ type ClientCallbacks = {
 
 module Client =
 
-    /// Connect to an SSH server and authenticate
-    let connectAsync
-        (host: string)
-        (port: int)
-        (config: ClientConfig)
-        (authConfig: ClientAuth.ClientAuthConfig) = async {
+    let private snapshot (client: SshClient) =
+        lock client.Runtime.ContextSync (fun () -> !client.Context)
 
-        let client = new TcpClient()
+    let private update (client: SshClient) change =
+        lock client.Runtime.ContextSync (fun () -> client.Context := change !client.Context)
+
+    let private stop (client: SshClient) =
+        lock client.Runtime.ContextSync (fun () ->
+            client.Context := { !client.Context with State = SessionState.Disconnected }
+            if not client.Runtime.Closed.IsCancellationRequested then client.Runtime.Closed.Cancel())
+        let manager = (snapshot client).ChannelManager
+        let ids = lock manager.Sync (fun () -> manager.Channels.Keys |> Seq.toArray)
+        for id in ids do Channel.ChannelManager.removeChannel manager id
+        // Interrupt any outstanding read as well as credit waiters.
+        client.TcpClient.Dispose()
+
+    /// All connection-protocol writes must go through this gate. Publication
+    /// merges only outbound cursors into the latest context, never a stale read
+    /// cursor or an obsolete channel-manager snapshot.
+    let private send (client: SshClient) message = async {
         try
-            do! client.ConnectAsync(host, port) |> Async.AwaitTask
-            let stream = client.GetStream()
-
-            let transportState = TransportState.createClient config.ClientVersion
-
-            // Version exchange (client reads server version first, then sends)
-            let! versionResult = Transport.exchangeVersionsAsClient stream config.ClientVersion
-            match versionResult with
-            | Error e ->
-                client.Dispose()
-                return Error e
-            | Ok serverVersion ->
-                let stateWithVersions = {
-                    transportState with
-                        ServerVersion = serverVersion
-                        ClientVersion = Some config.ClientVersion
-                }
-
-                // Key exchange
-                let! kexResult = ClientKeyExchange.handleKeyExchange stream stateWithVersions config.HostKeyVerification
-                match kexResult with
+            do! client.Runtime.SendGate.WaitAsync(client.Runtime.Closed.Token) |> Async.AwaitTask
+            try
+                let state = (snapshot client).TransportState
+                let! result = Transport.sendMessage client.Stream state message
+                match result with
+                | Ok next ->
+                    update client (fun ctx ->
+                        { ctx with TransportState = Transport.adoptWriteCursors ctx.TransportState next })
+                    return Ok ()
                 | Error e ->
-                    client.Dispose()
+                    stop client
                     return Error e
-                | Ok (transportAfterKex, kexState, _) ->
-                    match kexState.SessionId with
-                    | None ->
-                        client.Dispose()
-                        return Error (ProtocolError "No session ID after key exchange")
-                    | Some sessionId ->
-                        // Authenticate
-                        let! authResult = ClientAuth.authenticate stream transportAfterKex sessionId authConfig
-                        match authResult with
-                        | Error e ->
-                            client.Dispose()
-                            return Error e
-                        | Ok transportAfterAuth ->
-                            let ctx = {
-                                TransportState = transportAfterAuth
-                                KexState = kexState
-                                ChannelManager = Channel.ChannelManager.create()
-                                State = Authenticated
-                                Username = authConfig.Username
-                            }
-                            let sshClient = {
-                                TcpClient = client
-                                Stream = stream
-                                Context = ref ctx
-                            }
-                            return Ok sshClient
-        with ex ->
-            client.Dispose()
+            finally
+                client.Runtime.SendGate.Release() |> ignore
+        with
+        | :? OperationCanceledException -> return Error (ConnectionError "Connection closed")
+        | ex ->
+            stop client
             return Error (ConnectionError ex.Message)
     }
 
-    /// Open a session channel
-    let openChannel (client: SshClient) = async {
-        let ctx = !client.Context
-        let (newManager, channel) =
-            Channel.ChannelManager.allocateChannel
-                ctx.ChannelManager "session" 0u 0u 0u
-
-        // Send CHANNEL_OPEN
-        let openMsg = ChannelOpen(
-            "session",
-            channel.LocalChannel,
-            Constants.DefaultWindowSize,
-            Constants.DefaultMaxPacketSize,
-            [||])
-        let! sendResult = Transport.sendMessage client.Stream ctx.TransportState openMsg
-        match sendResult with
-        | Error e -> return Error e
-        | Ok stateAfterSend ->
-            client.Context := { ctx with TransportState = stateAfterSend; ChannelManager = newManager }
-
-            // Wait for CHANNEL_OPEN_CONFIRMATION (handle interleaved global requests etc.)
-            let rec waitForConfirmation () = async {
-                let! recvResult = Transport.receiveMessage client.Stream (!client.Context).TransportState
-                match recvResult with
-                | Error e -> return Error e
-                | Ok (msg, stateAfterRecv) ->
-                    client.Context := { !client.Context with TransportState = stateAfterRecv }
-                    match msg with
-                    | ChannelOpenConfirmation(_recipientChannel, senderChannel, windowSize, maxPacketSize, _) ->
-                        Channel.ChannelManager.updateChannel newManager channel.LocalChannel (fun ch ->
-                            { ch with
-                                RemoteChannel = senderChannel
-                                RemoteWindowSize = windowSize
-                                RemoteMaxPacketSize = maxPacketSize }
-                        ) |> ignore
-                        return Ok channel.LocalChannel
-                    | ChannelOpenFailure(_, reasonCode, description, _) ->
-                        return Error (ChannelError $"Channel open rejected ({reasonCode}): {description}")
-                    | GlobalRequest(_, wantReply, _) ->
-                        if wantReply then
-                            match! Transport.sendMessage client.Stream (!client.Context).TransportState RequestFailure with
-                            | Ok transport -> client.Context := { !client.Context with TransportState = transport }
-                            | Error _ -> ()
-                            ()
-                        return! waitForConfirmation ()
-                    | _ ->
-                        return! waitForConfirmation ()
-            }
-            return! waitForConfirmation ()
+    /// Called with ReceiveGate held. The wire reader may overlap a writer;
+    /// only the inbound sequence and IV from its result are published.
+    let private readWire (client: SshClient) = async {
+        try
+            let state = (snapshot client).TransportState
+            let! result = Transport.receiveMessage client.Stream state
+            match result with
+            | Error e ->
+                stop client
+                return Error e
+            | Ok (msg, next) ->
+                update client (fun ctx ->
+                    { ctx with TransportState = Transport.adoptReadCursors ctx.TransportState next })
+                return Ok msg
+        with ex ->
+            stop client
+            return Error (ConnectionError ex.Message)
     }
 
-    /// Wait for ChannelSuccess/ChannelFailure, handling any interleaved messages
-    /// (data, window adjust, etc. can arrive before the reply)
-    let private waitForChannelReply
-        (client: SshClient)
-        (pendingData: System.Collections.Generic.List<byte>)
-        (pendingStderr: System.Collections.Generic.List<byte>) = async {
-        let rec loop () = async {
-            let! recvResult = Transport.receiveMessage client.Stream (!client.Context).TransportState
-            match recvResult with
-            | Error e -> return Error e
-            | Ok (msg, stateAfterRecv) ->
-                client.Context := { !client.Context with TransportState = stateAfterRecv }
-                match msg with
-                | ChannelSuccess _ -> return Ok ()
-                | ChannelFailure _ -> return Error (ChannelError "Channel request rejected")
-                | ChannelData(_, data) ->
-                    pendingData.AddRange(data)
-                    return! loop ()
-                | ChannelExtendedData(_, _, data) ->
-                    pendingStderr.AddRange(data)
-                    return! loop ()
-                | ChannelWindowAdjust(recipientChannel, bytesToAdd) ->
-                    Channel.handleWindowAdjust (!client.Context).ChannelManager recipientChannel bytesToAdd |> ignore
-                    return! loop ()
-                | ChannelEof _ | ChannelClose _ | ChannelRequest _ ->
-                    // These can arrive if the server's callback already sent everything;
-                    // treat as implicit success
-                    return Ok ()
-                | _ ->
-                    return! loop ()
-        }
-        return! loop ()
+    let private receive (client: SshClient) = async {
+        try
+            do! client.Runtime.ReceiveGate.WaitAsync() |> Async.AwaitTask
+            try
+                if client.Runtime.PendingMessages.Count <> 0 then
+                    return Ok (client.Runtime.PendingMessages.Dequeue())
+                else if (snapshot client).State = SessionState.Disconnected then
+                    return Error (ConnectionError "Connection closed")
+                else
+                    let! result = readWire client
+                    return Result.map (fun msg -> msg, false) result
+            finally
+                client.Runtime.ReceiveGate.Release() |> ignore
+        with :? OperationCanceledException -> return Error (ConnectionError "Connection closed")
     }
 
-    /// Send a channel request and wait for the reply
-    let private sendChannelRequest
-        (client: SshClient)
-        (channelId: uint32)
-        (requestType: string)
-        (requestData: byte[]) = async {
-
-        let ctx = !client.Context
-        match Channel.ChannelManager.getChannel ctx.ChannelManager channelId with
-        | None -> return Error (ChannelError "Unknown channel")
-        | Some channel ->
-            let requestMsg = ChannelRequest(channel.RemoteChannel, requestType, true, requestData)
-            let! sendResult = Transport.sendMessage client.Stream ctx.TransportState requestMsg
-            match sendResult with
-            | Error e -> return Error e
-            | Ok stateAfterSend ->
-                client.Context := { !client.Context with TransportState = stateAfterSend }
-                let pendingData = System.Collections.Generic.List<byte>()
-                let pendingStderr = System.Collections.Generic.List<byte>()
-                let! result = waitForChannelReply client pendingData pendingStderr
+    /// Connect and authenticate within one deadline covering TCP, banner,
+    /// key exchange and user authentication. Closing the socket interrupts
+    /// pending stream reads when either the deadline or caller cancels.
+    let connectAsync (host: string) (port: int) (config: ClientConfig)
+        (authConfig: ClientAuth.ClientAuthConfig) = async {
+        let! callerToken = Async.CancellationToken
+        use deadline = CancellationTokenSource.CreateLinkedTokenSource(callerToken)
+        deadline.CancelAfter(config.ConnectTimeout)
+        let client = new TcpClient()
+        let mutable connected = false
+        try
+            try
+                let handshake = async {
+                    do! client.ConnectAsync(host, port, deadline.Token).AsTask() |> Async.AwaitTask
+                    let stream = client.GetStream()
+                    let transportState = TransportState.createClient config.ClientVersion
+                    match! Transport.exchangeVersionsAsClient stream config.ClientVersion with
+                    | Error e -> return Error e
+                    | Ok serverVersion ->
+                        let withVersions = {
+                            transportState with ServerVersion = serverVersion; ClientVersion = Some config.ClientVersion }
+                        match! ClientKeyExchange.handleKeyExchange stream withVersions config.HostKeyVerification with
+                        | Error e -> return Error e
+                        | Ok (transportAfterKex, kexState, _) ->
+                            match kexState.SessionId with
+                            | None -> return Error (ProtocolError "No session ID after key exchange")
+                            | Some sessionId ->
+                                match! ClientAuth.authenticate stream transportAfterKex sessionId authConfig with
+                                | Error e -> return Error e
+                                | Ok transportAfterAuth ->
+                                    let ctx = {
+                                        TransportState = transportAfterAuth
+                                        KexState = kexState
+                                        ChannelManager = Channel.ChannelManager.create()
+                                        State = Authenticated
+                                        Username = authConfig.Username
+                                    }
+                                    return Ok {
+                                        TcpClient = client
+                                        Stream = stream
+                                        Context = ref ctx
+                                        Runtime = ClientRuntime.create()
+                                    }
+                }
+                let! result = Async.StartAsTask(handshake, cancellationToken = deadline.Token) |> Async.AwaitTask
+                connected <- Result.isOk result
                 return result
+            with
+            | :? OperationCanceledException ->
+                return Error (ConnectionError (if callerToken.IsCancellationRequested then "Connection cancelled" else "Connection timed out"))
+            | ex -> return Error (ConnectionError ex.Message)
+        finally
+            if not connected then client.Dispose()
     }
 
-    /// Request a PTY on a channel
-    let requestPty
-        (client: SshClient)
-        (channelId: uint32)
-        (term: string)
-        (widthCols: uint32)
-        (heightRows: uint32) = async {
-        let requestData = Packet.buildChannelRequestData (
-            PtyReq(term, widthCols, heightRows, 0u, 0u, [||]))
-        return! sendChannelRequest client channelId "pty-req" requestData
+    let private manager (client: SshClient) = (snapshot client).ChannelManager
+
+    /// Process window grants even during reply waits, to unblock writers.
+    let private windowGrant (client: SshClient) recipient bytes =
+        Channel.handleWindowAdjust (manager client) recipient bytes |> ignore
+
+    /// Return receive credit even for data buffered while awaiting a reply.
+    let private replenish (client: SshClient) recipient length = async {
+        if length = 0 then return Ok ()
+        else
+            match Channel.ChannelManager.getChannel (manager client) recipient with
+            | None -> return Error (ChannelError $"Unknown channel: {recipient}")
+            | Some channel ->
+                Channel.ChannelManager.updateChannel (manager client) recipient (fun ch ->
+                    { ch with LocalWindowSize = ch.LocalWindowSize + uint32 length }) |> ignore
+                return! send client (ChannelWindowAdjust(channel.RemoteChannel, uint32 length))
     }
 
-    /// Request shell on a channel
-    let requestShell (client: SshClient) (channelId: uint32) = async {
-        return! sendChannelRequest client channelId "shell" [||]
+    /// Wait for a particular reply while retaining every interleaved channel
+    /// event in arrival order for the next receiveOne. The gate is held from
+    /// before sending the request through receipt of its reply, so another
+    /// consumer cannot accidentally take that reply.
+    let private awaitReply (client: SshClient) (channelId: uint32)
+        (accept: SshMessage -> SshResult<'a> option) = async {
+        let deferred = ResizeArray<SshMessage * bool>()
+        try
+            let mutable answer = None
+            while answer.IsNone do
+                match! readWire client with
+                | Error e -> answer <- Some (Error e)
+                | Ok msg ->
+                    match accept msg with
+                    | Some result -> answer <- Some result
+                    | None ->
+                        match msg with
+                        | ChannelWindowAdjust(recipient, bytes) -> windowGrant client recipient bytes
+                        | ChannelData(recipient, data)
+                        | ChannelExtendedData(recipient, _, data) ->
+                            match Channel.receiveDataCredit (manager client) recipient data.Length with
+                            | Error e -> answer <- Some (Error e)
+                            | Ok () ->
+                                match! replenish client recipient data.Length with
+                                | Error e -> answer <- Some (Error e)
+                                | Ok () -> deferred.Add((msg, true))
+                        | GlobalRequest(_, true, _) ->
+                            match! send client RequestFailure with
+                            | Error e -> answer <- Some (Error e)
+                            | Ok () -> ()
+                        | ChannelClose recipient when recipient = channelId ->
+                            // Acknowledge and remove immediately to unblock all
+                            // senders. Earlier data has already returned credit;
+                            // replay only its callback and the close callback.
+                            match Channel.ChannelManager.getChannel (manager client) recipient with
+                            | Some channel ->
+                                if not channel.IsClosed then
+                                    match! send client (ChannelClose(channel.RemoteChannel)) with
+                                    | Error e -> answer <- Some (Error e)
+                                    | Ok () -> ()
+                                Channel.ChannelManager.removeChannel (manager client) recipient
+                            | None -> ()
+                            if answer.IsNone then
+                                answer <- Some (Error (ChannelError "Channel closed before reply"))
+                            deferred.Add((msg, false))
+                        | Disconnect(_, description, _) ->
+                            deferred.Add((msg, false))
+                            stop client
+                            answer <- Some (Error (ConnectionError $"Server disconnected: {description}"))
+                        | _ -> deferred.Add((msg, false))
+            return answer.Value
+        finally
+            for msg in deferred do client.Runtime.PendingMessages.Enqueue(msg)
     }
 
-    /// Request exec on a channel
-    let requestExec (client: SshClient) (channelId: uint32) (command: string) = async {
-        let requestData = Packet.buildChannelRequestData (Exec(command))
-        return! sendChannelRequest client channelId "exec" requestData
+    /// Open a session channel.
+    let openChannel (client: SshClient) = async {
+        try
+            do! client.Runtime.ReceiveGate.WaitAsync(client.Runtime.Closed.Token) |> Async.AwaitTask
+            try
+                let previous = manager client
+                let (nextManager, channel) =
+                    Channel.ChannelManager.allocateChannel previous "session" 0u 0u 0u
+                update client (fun ctx -> { ctx with ChannelManager = nextManager })
+                let openMsg = ChannelOpen("session", channel.LocalChannel,
+                                          Constants.DefaultWindowSize, Constants.DefaultMaxPacketSize, [||])
+                match! send client openMsg with
+                | Error e ->
+                    Channel.ChannelManager.removeChannel nextManager channel.LocalChannel
+                    return Error e
+                | Ok () ->
+                    let accept = function
+                        | ChannelOpenConfirmation(recipient, remote, window, packetSize, _) when recipient = channel.LocalChannel ->
+                            Channel.ChannelManager.updateChannel nextManager recipient (fun ch ->
+                                { ch with RemoteChannel = remote; RemoteWindowSize = window; RemoteMaxPacketSize = packetSize }) |> ignore
+                            Some (Ok recipient)
+                        | ChannelOpenFailure(recipient, code, description, _) when recipient = channel.LocalChannel ->
+                            Some (Error (ChannelError $"Channel open rejected ({code}): {description}"))
+                        | _ -> None
+                    let! answer = awaitReply client channel.LocalChannel accept
+                    if Result.isError answer then Channel.ChannelManager.removeChannel nextManager channel.LocalChannel
+                    return answer
+            finally
+                client.Runtime.ReceiveGate.Release() |> ignore
+        with :? OperationCanceledException -> return Error (ConnectionError "Connection closed")
     }
 
-    /// Send data on a channel, waiting for peer window credit when the window
-    /// is exhausted instead of failing.
+    /// A channel request completes only on its own CHANNEL_SUCCESS or FAILURE.
+    /// Earlier data, exit status, EOF and close are replayed exactly once.
+    let private sendChannelRequest (client: SshClient) (channelId: uint32)
+        (requestType: string) (requestData: byte[]) = async {
+        try
+            do! client.Runtime.ReceiveGate.WaitAsync(client.Runtime.Closed.Token) |> Async.AwaitTask
+            try
+                match Channel.ChannelManager.getChannel (manager client) channelId with
+                | None -> return Error (ChannelError "Unknown channel")
+                | Some channel ->
+                    let msg = ChannelRequest(channel.RemoteChannel, requestType, true, requestData)
+                    match! send client msg with
+                    | Error e -> return Error e
+                    | Ok () ->
+                        return! awaitReply client channelId (function
+                            | ChannelSuccess recipient when recipient = channelId -> Some (Ok ())
+                            | ChannelFailure recipient when recipient = channelId ->
+                                Some (Error (ChannelError "Channel request rejected"))
+                            | _ -> None)
+            finally
+                client.Runtime.ReceiveGate.Release() |> ignore
+        with :? OperationCanceledException -> return Error (ConnectionError "Connection closed")
+    }
+
+    /// Request a PTY on a channel.
+    let requestPty (client: SshClient) (channelId: uint32)
+        (term: string) (widthCols: uint32) (heightRows: uint32) = async {
+        let data = Packet.buildChannelRequestData (PtyReq(term, widthCols, heightRows, 0u, 0u, [||]))
+        return! sendChannelRequest client channelId "pty-req" data
+    }
+
+    /// Request a shell on a channel.
+    let requestShell client channelId = sendChannelRequest client channelId "shell" [||]
+
+    /// Request exec on a channel.
+    let requestExec client channelId command =
+        sendChannelRequest client channelId "exec" (Packet.buildChannelRequestData (Exec(command)))
+
+    /// Send data, waiting for window credit until the channel closes, the
+    /// connection ends or the calling async computation is cancelled.
     let sendData (client: SshClient) (channelId: uint32) (data: byte[]) = async {
+        let! callerToken = Async.CancellationToken
+        use cancellation = CancellationTokenSource.CreateLinkedTokenSource(callerToken, client.Runtime.Closed.Token)
         let mutable position = 0
         let mutable failure : SshResult<unit> option = None
         while failure.IsNone && position < data.Length do
-            let pending = data.[position..]
-            match Channel.acquireOutboundCredit (!client.Context).ChannelManager channelId pending with
+            match Channel.acquireOutboundCredit (manager client) channelId data position with
             | Error e -> failure <- Some (Error e)
             | Ok (Channel.Waiting signal) ->
-                match! Channel.waitForCredit signal CancellationToken.None with
+                match! Channel.waitForCredit signal cancellation.Token with
                 | Error e -> failure <- Some (Error e)
                 | Ok () -> ()
             | Ok (Channel.Granted chunk) ->
-                let ctx = !client.Context
-                match Channel.ChannelManager.getChannel ctx.ChannelManager channelId with
+                match Channel.ChannelManager.getChannel (manager client) channelId with
                 | None -> failure <- Some (Error (ChannelError $"Unknown channel: {channelId}"))
                 | Some channel ->
-                    let! result =
-                        Transport.sendMessage client.Stream ctx.TransportState (ChannelData(channel.RemoteChannel, chunk))
-                    match result with
+                    match! send client (ChannelData(channel.RemoteChannel, chunk)) with
                     | Error e -> failure <- Some (Error e)
-                    | Ok newTransport ->
-                        client.Context := { !client.Context with TransportState = newTransport }
-                        position <- position + chunk.Length
-        match failure with
-        | Some result -> return result
-        | None -> return Ok ()
+                    | Ok () -> position <- position + chunk.Length
+        return defaultArg failure (Ok ())
     }
 
-    /// Send EOF on a channel
+    /// Send EOF on a channel.
     let sendEof (client: SshClient) (channelId: uint32) = async {
-        let ctx = !client.Context
-        let! result = Channel.sendChannelEof client.Stream ctx.TransportState ctx.ChannelManager channelId
-        match result with
-        | Error e -> return Error e
-        | Ok newTransport ->
-            client.Context := { !client.Context with TransportState = newTransport }
-            return Ok ()
+        match Channel.ChannelManager.getChannel (manager client) channelId with
+        | None -> return Error (ChannelError "Unknown channel")
+        | Some channel -> return! send client (ChannelEof(channel.RemoteChannel))
     }
 
-    /// Process one incoming message, dispatching to callbacks
+    /// Process one incoming event, including events buffered during a request.
     let receiveOne (client: SshClient) (callbacks: ClientCallbacks) = async {
-        let ctx = !client.Context
-        let! result = Transport.receiveMessage client.Stream ctx.TransportState
-        match result with
+        match! receive client with
         | Error e -> return Error e
-        | Ok (msg, newTransportState) ->
-            client.Context := { !client.Context with TransportState = newTransportState }
-
-            // Give the server back the window the data used, so output past
-            // the initial window (2 MB) keeps flowing instead of stalling.
-            let replenish (recipientChannel: uint32) (length: int) = async {
-                if length = 0 then return Ok ()
-                else
-                    let current = !client.Context
-                    let! adjusted =
-                        Channel.sendWindowAdjust client.Stream current.TransportState current.ChannelManager recipientChannel (uint32 length)
-                    match adjusted with
-                    | Ok transport ->
-                        client.Context := { !client.Context with TransportState = transport }
-                        return Ok ()
-                    | Error e -> return Error e
-            }
-
+        | Ok (msg, accounted) ->
             match msg with
-            | ChannelData(recipientChannel, data) ->
-                do! callbacks.OnStdout recipientChannel data
-                match! replenish recipientChannel data.Length with
-                | Ok () -> return Ok true
+            | ChannelData(recipient, data) ->
+                let credit =
+                    if accounted then Ok ()
+                    else Channel.receiveDataCredit (manager client) recipient data.Length
+                match credit with
                 | Error e -> return Error e
-
-            | ChannelExtendedData(recipientChannel, _dataTypeCode, data) ->
-                do! callbacks.OnStderr recipientChannel data
-                match! replenish recipientChannel data.Length with
-                | Ok () -> return Ok true
+                | Ok () ->
+                    do! callbacks.OnStdout recipient data
+                    if accounted then return Ok true
+                    else
+                        match! replenish client recipient data.Length with
+                        | Ok () -> return Ok true
+                        | Error e -> return Error e
+            | ChannelExtendedData(recipient, _, data) ->
+                let credit =
+                    if accounted then Ok ()
+                    else Channel.receiveDataCredit (manager client) recipient data.Length
+                match credit with
                 | Error e -> return Error e
-
-            | ChannelRequest(_, "exit-status", _, data) ->
-                let exitStatus = Packet.readUint32 data 0
-                // We don't know the channel from the request alone, use 0 as placeholder
-                do! callbacks.OnExit 0u exitStatus
+                | Ok () ->
+                    do! callbacks.OnStderr recipient data
+                    if accounted then return Ok true
+                    else
+                        match! replenish client recipient data.Length with
+                        | Ok () -> return Ok true
+                        | Error e -> return Error e
+            | ChannelRequest(recipient, "exit-status", _, data) ->
+                if data.Length <> 4 then
+                    stop client
+                    return Error (ProtocolError "Invalid exit-status request")
+                else
+                    do! callbacks.OnExit recipient (Packet.readUint32 data 0)
+                    return Ok true
+            | ChannelEof _ -> return Ok true
+            | ChannelClose recipient ->
+                let! reply =
+                    match Channel.ChannelManager.getChannel (manager client) recipient with
+                    | Some channel when not channel.IsClosed ->
+                        send client (ChannelClose(channel.RemoteChannel))
+                    | _ -> async { return Ok () }
+                Channel.ChannelManager.removeChannel (manager client) recipient
+                match reply with
+                | Error error -> return Error error
+                | Ok () ->
+                    do! callbacks.OnChannelClose recipient
+                    return Ok false
+            | ChannelWindowAdjust(recipient, bytes) ->
+                windowGrant client recipient bytes
                 return Ok true
-
-            | ChannelEof _ ->
-                return Ok true
-
-            | ChannelClose(recipientChannel) ->
-                // Send close back
-                match Channel.ChannelManager.getChannel (!client.Context).ChannelManager recipientChannel with
-                | Some channel ->
-                    // Keep the advanced transport state: discarding it reused
-                    // the outbound sequence number and cipher counter, so the
-                    // next packet failed the server's MAC check.
-                    match! Transport.sendMessage client.Stream (!client.Context).TransportState (ChannelClose(channel.RemoteChannel)) with
-                    | Ok transport -> client.Context := { !client.Context with TransportState = transport }
-                    | Error _ -> ()
-                | None -> ()
-                do! callbacks.OnChannelClose recipientChannel
-                return Ok false  // Channel closed, done
-
-            | ChannelWindowAdjust(recipientChannel, bytesToAdd) ->
-                Channel.handleWindowAdjust (!client.Context).ChannelManager recipientChannel bytesToAdd |> ignore
-                return Ok true
-
             | Disconnect(_, description, _) ->
-                client.Context := { !client.Context with State = SessionState.Disconnected }
+                stop client
                 return Error (ConnectionError $"Server disconnected: {description}")
-
-            | _ ->
-                return Ok true
+            | _ -> return Ok true
     }
 
-    /// Run receive loop until channel closes or error
+    /// Run the receive loop until channel close or an error.
     let receiveLoop (client: SshClient) (callbacks: ClientCallbacks) = async {
         let mutable running = true
-        let mutable lastError = None
+        let mutable error = None
         while running do
-            let! result = receiveOne client callbacks
-            match result with
+            match! receiveOne client callbacks with
             | Ok true -> ()
             | Ok false -> running <- false
             | Error e ->
-                lastError <- Some e
+                stop client
+                error <- Some e
                 running <- false
-        return
-            match lastError with
-            | Some e -> Error e
-            | None -> Ok ()
+        return match error with Some e -> Error e | None -> Ok ()
     }
 
-    /// Execute a command and collect all output
+    /// Execute a command and collect output. A close without exit-status is
+    /// not a successful command completion.
     let exec (client: SshClient) (command: string) = async {
-        let! channelResult = openChannel client
-        match channelResult with
+        match! openChannel client with
         | Error e -> return Error e
         | Ok channelId ->
-            let ctx = !client.Context
-            match Channel.ChannelManager.getChannel ctx.ChannelManager channelId with
+            match Channel.ChannelManager.getChannel (manager client) channelId with
             | None -> return Error (ChannelError "Unknown channel")
             | Some channel ->
-                // Send exec request (wantReply=false to avoid ordering issues)
-                let requestData = Packet.buildChannelRequestData (Exec(command))
-                let requestMsg = ChannelRequest(channel.RemoteChannel, "exec", false, requestData)
-                let! sendResult = Transport.sendMessage client.Stream ctx.TransportState requestMsg
-                match sendResult with
+                let request = ChannelRequest(channel.RemoteChannel, "exec", false,
+                                             Packet.buildChannelRequestData (Exec(command)))
+                match! send client request with
                 | Error e -> return Error e
-                | Ok stateAfterSend ->
-                    client.Context := { !client.Context with TransportState = stateAfterSend }
-
-                    // Collect all output in a single receive loop
-                    let stdout = System.Collections.Generic.List<byte>()
-                    let stderr = System.Collections.Generic.List<byte>()
-                    let mutable exitCode = 0u
-
+                | Ok () ->
+                    let stdout = ResizeArray<byte>()
+                    let stderr = ResizeArray<byte>()
+                    let mutable exitCode = None
                     let callbacks = {
-                        OnStdout = fun _ data -> async { stdout.AddRange(data) }
-                        OnStderr = fun _ data -> async { stderr.AddRange(data) }
-                        OnExit = fun _ code -> async { exitCode <- code }
+                        OnStdout = fun recipient data -> async {
+                            if recipient = channelId then stdout.AddRange(data) }
+                        OnStderr = fun recipient data -> async {
+                            if recipient = channelId then stderr.AddRange(data) }
+                        OnExit = fun recipient code -> async {
+                            if recipient = channelId then exitCode <- Some code }
                         OnChannelClose = fun _ -> async { () }
                     }
-
-                    let! _ = receiveLoop client callbacks
-                    return Ok (exitCode, stdout.ToArray(), stderr.ToArray())
+                    match! receiveLoop client callbacks with
+                    | Error e -> return Error e
+                    | Ok () ->
+                        match exitCode with
+                        | None -> return Error (ChannelError "Channel closed without exit status")
+                        | Some code -> return Ok (code, stdout.ToArray(), stderr.ToArray())
     }
 
-    /// Disconnect gracefully
+    /// Disconnect gracefully and unblock pending channel writers/readers.
     let disconnect (client: SshClient) = async {
-        let ctx = !client.Context
-        let disconnectMsg = Disconnect(
-            DisconnectReason.SSH_DISCONNECT_BY_APPLICATION,
-            "Client disconnecting", "")
-        let! _ = Transport.sendMessage client.Stream ctx.TransportState disconnectMsg
-        client.Context := { !client.Context with State = SessionState.Disconnected }
-        client.TcpClient.Dispose()
+        if (snapshot client).State <> SessionState.Disconnected then
+            let msg = Disconnect(DisconnectReason.SSH_DISCONNECT_BY_APPLICATION, "Client disconnecting", "")
+            let! _ = send client msg
+            ()
+        stop client
     }

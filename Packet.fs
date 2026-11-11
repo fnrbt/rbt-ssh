@@ -6,32 +6,47 @@ open System.Text
 
 module Packet =
 
+    /// Read helpers throw ArgumentException for malformed or truncated SSH data.
+    /// Offsets and length prefixes are checked before arithmetic or allocation.
+    let private requireRange (data: byte[]) (offset: int) (length: int) =
+        if isNull data || offset < 0 || length < 0 || offset > data.Length || length > data.Length - offset then
+            invalidArg "data" "Truncated or invalid SSH field"
+
+
     // Read a uint32 from a byte array at offset (big-endian)
     let readUint32 (data: byte[]) (offset: int) =
-        let bytes = data.[offset..offset+3]
-        if BitConverter.IsLittleEndian then
-            Array.Reverse(bytes)
-        BitConverter.ToUInt32(ReadOnlySpan(bytes))
+        requireRange data offset 4
+        (uint32 data.[offset] <<< 24)
+        ||| (uint32 data.[offset + 1] <<< 16)
+        ||| (uint32 data.[offset + 2] <<< 8)
+        ||| uint32 data.[offset + 3]
+
+    let private readFieldLength (data: byte[]) (offset: int) =
+        requireRange data offset 4
+        let size = readUint32 data offset
+        let start = offset + 4
+        if uint64 size > uint64 (data.Length - start) then
+            invalidArg "data" "SSH field length exceeds remaining data"
+        start, int size
 
     // Read a byte from a byte array at offset
     let readByte (data: byte[]) (offset: int) =
+        requireRange data offset 1
         data.[offset]
 
     // Read an SSH string (uint32 length + data)
     let readString (data: byte[]) (offset: int) =
-        let length = int (readUint32 data offset)
-        let str = Encoding.UTF8.GetString(data, offset + 4, length)
-        (str, offset + 4 + length)
+        let start, length = readFieldLength data offset
+        (Encoding.UTF8.GetString(data, start, length), start + length)
 
     // Read raw bytes with length prefix
     let readBytes (data: byte[]) (offset: int) =
-        let length = int (readUint32 data offset)
-        let bytes = data.[offset + 4 .. offset + 4 + length - 1]
-        (bytes, offset + 4 + length)
+        let start, length = readFieldLength data offset
+        (data.[start .. start + length - 1], start + length)
 
     // Read a boolean
     let readBool (data: byte[]) (offset: int) =
-        (data.[offset] <> 0uy, offset + 1)
+        (readByte data offset <> 0uy, offset + 1)
 
     // Read a name-list (comma-separated strings)
     let readNameList (data: byte[]) (offset: int) =
@@ -43,12 +58,8 @@ module Packet =
 
     // Read an mpint (SSH multiprecision integer)
     let readMpint (data: byte[]) (offset: int) =
-        let length = int (readUint32 data offset)
-        if length = 0 then
-            ([| 0uy |], offset + 4)
-        else
-            let bytes = data.[offset + 4 .. offset + 4 + length - 1]
-            (bytes, offset + 4 + length)
+        let bytes, next = readBytes data offset
+        if bytes.Length = 0 then ([| 0uy |], next) else (bytes, next)
 
     // Write a uint32 to big-endian bytes
     let writeUint32 (value: uint32) =
@@ -86,9 +97,13 @@ module Packet =
         let mpint = if needsPadding then Array.append [| 0uy |] trimmed else trimmed
         Array.append (writeUint32 (uint32 mpint.Length)) mpint
 
-    // Build an unencrypted SSH packet
-    // Format: uint32 packet_length || byte padding_length || payload || padding || MAC (added later)
+    /// Build an aligned SSH packet. Invalid payload, block size, or packet length
+    /// throws ArgumentException (writePacket converts it to ProtocolError).
     let buildPacket (payload: byte[]) (blockSize: int) =
+        if isNull payload || payload.Length = 0 then
+            invalidArg "payload" "SSH payload must contain a message type"
+        if blockSize < 8 || blockSize > 128 then
+            invalidArg "blockSize" "Invalid SSH block size"
         // RFC 4253: The total length of (packet_length || padding_length || payload || padding)
         // must be a multiple of the cipher block size or 8, whichever is larger.
         // packet_length field itself (4 bytes) is included in alignment calculation.
@@ -97,20 +112,22 @@ module Packet =
 
         // Total packet on wire = 4 (packet_length) + 1 (padding_length) + payload + padding
         // This total must be a multiple of blockSize
-        let baseSize = 4 + 1 + payload.Length + minPadding
-        let remainder = baseSize % blockSize
+        let baseSize = int64 payload.Length + 9L
+        let remainder = int (baseSize % int64 blockSize)
         let paddingLength =
             if remainder = 0 then minPadding
             else minPadding + (blockSize - remainder)
 
         // Ensure minimum packet size of 16 bytes (including packet_length field)
         let paddingLength =
-            if 4 + 1 + payload.Length + paddingLength < 16 then
+            if baseSize + int64 (paddingLength - minPadding) < 16L then
                 paddingLength + blockSize
             else
                 paddingLength
 
-        let packetLength = 1 + payload.Length + paddingLength
+        let packetLength = baseSize + int64 (paddingLength - minPadding) - 4L
+        if paddingLength > 255 || packetLength > int64 Constants.MaxPacketSize then
+            invalidArg "payload" "SSH packet exceeds permitted padding or packet length"
         let padding = Crypto.randomBytes paddingLength
 
         Array.concat [|
@@ -120,14 +137,41 @@ module Packet =
             padding
         |]
 
-    // Parse an SSH message from payload
+    /// Parse one complete SSH message. Malformed, truncated, or trailing fields
+    /// throw ArgumentException; receiveMessage converts this to ProtocolError.
+    /// Unknown message types retain their opaque payload.
     let parseMessage (payload: byte[]) : SshMessage =
-        if payload.Length < 1 then
-            RawMessage(0uy, [||])
-        else
-            let msgType = payload.[0]
-            let data = payload.[1..]
+        requireRange payload 0 1
+        let msgType = payload.[0]
+        let data = payload.[1..]
+        let mutable consumed = 0
+        let readUint32Original = readUint32
+        let readStringOriginal = readString
+        let readBytesOriginal = readBytes
+        let readBoolOriginal = readBool
+        let readNameListOriginal = readNameList
+        let readUint32 data offset =
+            let value = readUint32Original data offset
+            consumed <- max consumed (offset + 4)
+            value
+        let readString data offset =
+            let value, next = readStringOriginal data offset
+            consumed <- max consumed next
+            value, next
+        let readBytes data offset =
+            let value, next = readBytesOriginal data offset
+            consumed <- max consumed next
+            value, next
+        let readBool data offset =
+            let value, next = readBoolOriginal data offset
+            consumed <- max consumed next
+            value, next
+        let readNameList data offset =
+            let value, next = readNameListOriginal data offset
+            consumed <- max consumed next
+            value, next
 
+        let message =
             match msgType with
             | MessageTypes.SSH_MSG_DISCONNECT ->
                 let reason = readUint32 data 0
@@ -158,6 +202,7 @@ module Packet =
                 ServiceAccept(serviceName)
 
             | MessageTypes.SSH_MSG_KEXINIT ->
+                requireRange data 0 16
                 let cookie = data.[0..15]
                 let (kexAlgorithms, offset1) = readNameList data 16
                 let (serverHostKeyAlgorithms, offset2) = readNameList data offset1
@@ -169,7 +214,9 @@ module Packet =
                 let (compressionServerToClient, offset8) = readNameList data offset7
                 let (languagesClientToServer, offset9) = readNameList data offset8
                 let (languagesServerToClient, offset10) = readNameList data offset9
-                let (firstKexPacketFollows, _) = readBool data offset10
+                let (firstKexPacketFollows, offset11) = readBool data offset10
+                if readUint32 data offset11 <> 0u then
+                    invalidArg "payload" "Nonzero KEXINIT reserved field"
                 KexInit(cookie, kexAlgorithms, serverHostKeyAlgorithms,
                         encryptionClientToServer, encryptionServerToClient,
                         macClientToServer, macServerToClient,
@@ -198,7 +245,8 @@ module Packet =
                     match methodName with
                     | "none" -> AuthMethodData.NoAuth
                     | "password" ->
-                        let (_falseFlag, offset4) = readBool data offset3
+                        let (changedPassword, offset4) = readBool data offset3
+                        if changedPassword then invalidArg "payload" "Unsupported password change request"
                         let (password, _) = readString data offset4
                         Password(password)
                     | "publickey" ->
@@ -210,7 +258,16 @@ module Packet =
                             PublicKey(algorithmName, publicKeyBlob, Some signature)
                         else
                             PublicKey(algorithmName, publicKeyBlob, None)
-                    | _ -> AuthMethodData.NoAuth
+                    | "hostbased" ->
+                        let (algorithmName, offset4) = readString data offset3
+                        let (publicKeyBlob, offset5) = readBytes data offset4
+                        let (clientHostName, offset6) = readString data offset5
+                        let (clientUserName, offset7) = readString data offset6
+                        let (signature, _) = readBytes data offset7
+                        HostBased(algorithmName, publicKeyBlob, clientHostName, clientUserName, signature)
+                    | _ ->
+                        consumed <- data.Length // Unknown auth method fields are opaque.
+                        AuthMethodData.NoAuth
                 UserAuthRequest(userName, serviceName, methodName, methodData)
 
             | MessageTypes.SSH_MSG_USERAUTH_FAILURE ->
@@ -235,9 +292,11 @@ module Packet =
                 let (requestName, offset1) = readString data 0
                 let (wantReply, offset2) = readBool data offset1
                 let requestData = data.[offset2..]
+                consumed <- data.Length
                 GlobalRequest(requestName, wantReply, requestData)
 
             | MessageTypes.SSH_MSG_REQUEST_SUCCESS ->
+                consumed <- data.Length
                 RequestSuccess(data)
 
             | MessageTypes.SSH_MSG_REQUEST_FAILURE ->
@@ -249,6 +308,7 @@ module Packet =
                 let initialWindowSize = readUint32 data (offset1 + 4)
                 let maximumPacketSize = readUint32 data (offset1 + 8)
                 let channelData = data.[offset1 + 12..]
+                consumed <- data.Length
                 ChannelOpen(channelType, senderChannel, initialWindowSize, maximumPacketSize, channelData)
 
             | MessageTypes.SSH_MSG_CHANNEL_OPEN_CONFIRMATION ->
@@ -257,6 +317,7 @@ module Packet =
                 let initialWindowSize = readUint32 data 8
                 let maximumPacketSize = readUint32 data 12
                 let channelData = data.[16..]
+                consumed <- data.Length
                 ChannelOpenConfirmation(recipientChannel, senderChannel, initialWindowSize, maximumPacketSize, channelData)
 
             | MessageTypes.SSH_MSG_CHANNEL_OPEN_FAILURE ->
@@ -295,6 +356,7 @@ module Packet =
                 let (requestType, offset1) = readString data 4
                 let (wantReply, offset2) = readBool data offset1
                 let requestData = data.[offset2..]
+                consumed <- data.Length
                 ChannelRequest(recipientChannel, requestType, wantReply, requestData)
 
             | MessageTypes.SSH_MSG_CHANNEL_SUCCESS ->
@@ -306,7 +368,11 @@ module Packet =
                 ChannelFailure(recipientChannel)
 
             | _ ->
+                consumed <- data.Length
                 RawMessage(msgType, data)
+        if consumed <> data.Length then
+            invalidArg "payload" "Unexpected trailing SSH message fields"
+        message
 
     // Build message payload from SshMessage
     let buildMessagePayload (msg: SshMessage) : byte[] =
@@ -553,8 +619,33 @@ module Packet =
         | RawMessage(msgType, data) ->
             Array.append [| msgType |] data
 
-    // Parse channel request data
+    /// Parse known channel requests completely; unknown requests retain opaque data.
+    /// Malformed or trailing fields throw ArgumentException.
     let parseChannelRequest (requestType: string) (data: byte[]) : ChannelRequestData =
+        let mutable consumed = 0
+        let readUint32Original = readUint32
+        let readStringOriginal = readString
+        let readBytesOriginal = readBytes
+        let readBoolOriginal = readBool
+        let readUint32 data offset =
+            let value = readUint32Original data offset
+            consumed <- max consumed (offset + 4)
+            value
+        let readString data offset =
+            let value, next = readStringOriginal data offset
+            consumed <- max consumed next
+            value, next
+        let readBytes data offset =
+            let value, next = readBytesOriginal data offset
+            consumed <- max consumed next
+            value, next
+        let readBool data offset =
+            let value, next = readBoolOriginal data offset
+            consumed <- max consumed next
+            value, next
+        let finish request =
+            if consumed <> data.Length then invalidArg "data" "Unexpected trailing SSH channel request fields"
+            request
         match requestType with
         | "pty-req" ->
             let (term, offset1) = readString data 0
@@ -563,40 +654,40 @@ module Packet =
             let widthPixels = readUint32 data (offset1 + 8)
             let heightPixels = readUint32 data (offset1 + 12)
             let (modes, _) = readBytes data (offset1 + 16)
-            PtyReq(term, widthChars, heightRows, widthPixels, heightPixels, modes)
+            finish (PtyReq(term, widthChars, heightRows, widthPixels, heightPixels, modes))
 
         | "shell" ->
-            Shell
+            finish Shell
 
         | "exec" ->
             let (command, _) = readString data 0
-            Exec(command)
+            finish (Exec(command))
 
         | "subsystem" ->
             let (name, _) = readString data 0
-            Subsystem(name)
+            finish (Subsystem(name))
 
         | "window-change" ->
             let widthChars = readUint32 data 0
             let heightRows = readUint32 data 4
             let widthPixels = readUint32 data 8
             let heightPixels = readUint32 data 12
-            WindowChange(widthChars, heightRows, widthPixels, heightPixels)
+            finish (WindowChange(widthChars, heightRows, widthPixels, heightPixels))
 
         | "signal" ->
             let (signalName, _) = readString data 0
-            Signal(signalName)
+            finish (Signal(signalName))
 
         | "exit-status" ->
             let exitStatus = readUint32 data 0
-            ExitStatus(exitStatus)
+            finish (ExitStatus(exitStatus))
 
         | "exit-signal" ->
             let (signalName, offset1) = readString data 0
             let (coreDumped, offset2) = readBool data offset1
             let (errorMessage, offset3) = readString data offset2
             let (language, _) = readString data offset3
-            ExitSignal(signalName, coreDumped, errorMessage, language)
+            finish (ExitSignal(signalName, coreDumped, errorMessage, language))
 
         | _ ->
             Unknown(requestType, data)
