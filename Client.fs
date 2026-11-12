@@ -22,6 +22,9 @@ type ClientRuntime = {
     ContextSync: obj
     /// True when credit was returned during a request-reply wait.
     PendingMessages: Queue<SshMessage * bool>
+    /// A wire read started by a sender waiting for window credit. The next
+    /// ReceiveGate holder takes its result before reading the wire itself.
+    mutable InFlightRead: Tasks.Task<SshResult<SshMessage>> option
     Closed: CancellationTokenSource
 }
 
@@ -31,6 +34,7 @@ module ClientRuntime =
         ReceiveGate = new SemaphoreSlim(1, 1)
         ContextSync = obj ()
         PendingMessages = Queue<SshMessage * bool>()
+        InFlightRead = None
         Closed = new CancellationTokenSource()
     }
 
@@ -93,9 +97,11 @@ module Client =
             return Error (ConnectionError ex.Message)
     }
 
-    /// Called with ReceiveGate held. The wire reader may overlap a writer;
-    /// only the inbound sequence and IV from its result are published.
-    let private readWire (client: SshClient) = async {
+    /// Read one packet from the wire. The wire reader may overlap a writer;
+    /// only the inbound sequence and IV from its result are published. At
+    /// most one read is outstanding: callers hold ReceiveGate, or start the
+    /// read under it as InFlightRead.
+    let private readPacket (client: SshClient) = async {
         try
             let state = (snapshot client).TransportState
             let! result = Transport.receiveMessage client.Stream state
@@ -110,6 +116,16 @@ module Client =
         with ex ->
             stop client
             return Error (ConnectionError ex.Message)
+    }
+
+    /// Called with ReceiveGate held. Takes the result of a read a credit
+    /// waiter left in flight before reading the wire.
+    let private readWire (client: SshClient) = async {
+        match client.Runtime.InFlightRead with
+        | Some read ->
+            client.Runtime.InFlightRead <- None
+            return! Async.AwaitTask read
+        | None -> return! readPacket client
     }
 
     let private receive (client: SshClient) = async {
@@ -201,6 +217,49 @@ module Client =
                 return! send client (ChannelWindowAdjust(channel.RemoteChannel, uint32 length))
     }
 
+    /// Handle a message no reader has asked for, with ReceiveGate held:
+    /// window grants are applied now, every channel event is retained in
+    /// arrival order for the next receiveOne, and buffered data returns its
+    /// receive credit at once so the peer keeps sending. A close of
+    /// `channelId` is acknowledged and the channel removed immediately, to
+    /// release its senders; the result is then `closedError`.
+    let private absorb (client: SshClient) (channelId: uint32) (closedError: string)
+        (defer: SshMessage * bool -> unit) (msg: SshMessage) = async {
+        match msg with
+        | ChannelWindowAdjust(recipient, bytes) ->
+            windowGrant client recipient bytes
+            return Ok ()
+        | ChannelData(recipient, data)
+        | ChannelExtendedData(recipient, _, data) ->
+            match Channel.receiveDataCredit (manager client) recipient data.Length with
+            | Error e -> return Error e
+            | Ok () ->
+                match! replenish client recipient data.Length with
+                | Error e -> return Error e
+                | Ok () ->
+                    defer (msg, true)
+                    return Ok ()
+        | GlobalRequest(_, true, _) -> return! send client RequestFailure
+        | ChannelClose recipient when recipient = channelId ->
+            // Earlier data has already returned credit; replay only its
+            // callback and the close callback.
+            let! ack = async {
+                match Channel.ChannelManager.getChannel (manager client) recipient with
+                | Some channel when not channel.IsClosed -> return! send client (ChannelClose(channel.RemoteChannel))
+                | _ -> return Ok ()
+            }
+            Channel.ChannelManager.removeChannel (manager client) recipient
+            defer (msg, false)
+            return (match ack with Error e -> Error e | Ok () -> Error (ChannelError closedError))
+        | Disconnect(_, description, _) ->
+            defer (msg, false)
+            stop client
+            return Error (ConnectionError $"Server disconnected: {description}")
+        | _ ->
+            defer (msg, false)
+            return Ok ()
+    }
+
     /// Wait for a particular reply while retaining every interleaved channel
     /// event in arrival order for the next receiveOne. The gate is held from
     /// before sending the request through receipt of its reply, so another
@@ -217,43 +276,70 @@ module Client =
                     match accept msg with
                     | Some result -> answer <- Some result
                     | None ->
-                        match msg with
-                        | ChannelWindowAdjust(recipient, bytes) -> windowGrant client recipient bytes
-                        | ChannelData(recipient, data)
-                        | ChannelExtendedData(recipient, _, data) ->
-                            match Channel.receiveDataCredit (manager client) recipient data.Length with
-                            | Error e -> answer <- Some (Error e)
-                            | Ok () ->
-                                match! replenish client recipient data.Length with
-                                | Error e -> answer <- Some (Error e)
-                                | Ok () -> deferred.Add((msg, true))
-                        | GlobalRequest(_, true, _) ->
-                            match! send client RequestFailure with
-                            | Error e -> answer <- Some (Error e)
-                            | Ok () -> ()
-                        | ChannelClose recipient when recipient = channelId ->
-                            // Acknowledge and remove immediately to unblock all
-                            // senders. Earlier data has already returned credit;
-                            // replay only its callback and the close callback.
-                            match Channel.ChannelManager.getChannel (manager client) recipient with
-                            | Some channel ->
-                                if not channel.IsClosed then
-                                    match! send client (ChannelClose(channel.RemoteChannel)) with
-                                    | Error e -> answer <- Some (Error e)
-                                    | Ok () -> ()
-                                Channel.ChannelManager.removeChannel (manager client) recipient
-                            | None -> ()
-                            if answer.IsNone then
-                                answer <- Some (Error (ChannelError "Channel closed before reply"))
-                            deferred.Add((msg, false))
-                        | Disconnect(_, description, _) ->
-                            deferred.Add((msg, false))
-                            stop client
-                            answer <- Some (Error (ConnectionError $"Server disconnected: {description}"))
-                        | _ -> deferred.Add((msg, false))
+                        match! absorb client channelId "Channel closed before reply" deferred.Add msg with
+                        | Error e -> answer <- Some (Error e)
+                        | Ok () -> ()
             return answer.Value
         finally
             for msg in deferred do client.Runtime.PendingMessages.Enqueue(msg)
+    }
+
+    /// Wait for the peer to grant window credit (`signal`). The grant arrives
+    /// as a CHANNEL_WINDOW_ADJUST, which only a reader processes, so when no
+    /// one else holds ReceiveGate the sender reads for itself. It never blocks
+    /// on the wire while holding the gate: the read is left in flight and the
+    /// gate released, so a concurrent request or receiveOne can still take the
+    /// gate and consume that read's result. Returns after one step; the caller
+    /// asks for credit again.
+    let private awaitCredit (client: SshClient) (channelId: uint32)
+        (signal: Tasks.TaskCompletionSource<unit>) (ct: CancellationToken) = async {
+        let runtime = client.Runtime
+        let cancelled = Error (ChannelError "Channel send cancelled")
+        use gateWait = CancellationTokenSource.CreateLinkedTokenSource(ct)
+        let gate = runtime.ReceiveGate.WaitAsync(gateWait.Token)
+        let! first = Tasks.Task.WhenAny(signal.Task :> Tasks.Task, gate) |> Async.AwaitTask
+        if not (obj.ReferenceEquals(first, gate)) then
+            // Credit arrived; give back the gate if it was acquired anyway.
+            gateWait.Cancel()
+            let! acquired = task {
+                try
+                    do! gate
+                    return true
+                with :? OperationCanceledException -> return false } |> Async.AwaitTask
+            if acquired then runtime.ReceiveGate.Release() |> ignore
+            return Ok ()
+        elif gate.IsCanceled then return cancelled
+        else
+            let! step = async {
+                try
+                    if signal.Task.IsCompleted then return Ok None
+                    else
+                        match runtime.InFlightRead with
+                        | Some read when read.IsCompleted ->
+                            runtime.InFlightRead <- None
+                            match read.Result with
+                            | Error e -> return Error e
+                            | Ok msg ->
+                                let! absorbed =
+                                    absorb client channelId "Channel closed while sending"
+                                        runtime.PendingMessages.Enqueue msg
+                                return Result.map (fun () -> None) absorbed
+                        | Some read -> return Ok (Some read)
+                        | None ->
+                            let read = Async.StartAsTask(readPacket client)
+                            runtime.InFlightRead <- Some read
+                            return Ok (Some read)
+                finally
+                    runtime.ReceiveGate.Release() |> ignore
+            }
+            match step with
+            | Error e -> return Error e
+            | Ok None -> return Ok ()
+            | Ok (Some read) ->
+                try
+                    let! _ = Tasks.Task.WhenAny(signal.Task :> Tasks.Task, read.WaitAsync(ct) :> Tasks.Task) |> Async.AwaitTask
+                    return (if ct.IsCancellationRequested && not signal.Task.IsCompleted then cancelled else Ok ())
+                with :? OperationCanceledException -> return cancelled
     }
 
     /// Open a session channel.
@@ -327,7 +413,9 @@ module Client =
         sendChannelRequest client channelId "exec" (Packet.buildChannelRequestData (Exec(command)))
 
     /// Send data, waiting for window credit until the channel closes, the
-    /// connection ends or the calling async computation is cancelled.
+    /// connection ends or the calling async computation is cancelled. While
+    /// waiting it processes incoming messages itself when no other reader is
+    /// active, so a caller may write everything before it starts reading.
     let sendData (client: SshClient) (channelId: uint32) (data: byte[]) = async {
         let! callerToken = Async.CancellationToken
         use cancellation = CancellationTokenSource.CreateLinkedTokenSource(callerToken, client.Runtime.Closed.Token)
@@ -337,7 +425,7 @@ module Client =
             match Channel.acquireOutboundCredit (manager client) channelId data position with
             | Error e -> failure <- Some (Error e)
             | Ok (Channel.Waiting signal) ->
-                match! Channel.waitForCredit signal cancellation.Token with
+                match! awaitCredit client channelId signal cancellation.Token with
                 | Error e -> failure <- Some (Error e)
                 | Ok () -> ()
             | Ok (Channel.Granted chunk) ->

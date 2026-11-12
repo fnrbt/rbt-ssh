@@ -302,3 +302,59 @@ let ``connect timeout includes silent version exchange`` () =
         finally
             listener.Stop()
     })
+
+[<Fact>]
+let ``send larger than the peer window completes when nothing else reads`` () =
+    Async.RunSynchronously(async {
+        let! client, serverSocket = pair ()
+        use serverSocket = serverSocket
+        try
+            let window = 32768
+            Channel.ChannelManager.updateChannel (!client.Context).ChannelManager 0u
+                (fun channel -> { channel with RemoteWindowSize = uint32 window }) |> ignore
+            let payload = Array.init (4 * 1024 * 1024) (fun i -> byte (i * 31 + i / 4096))
+            let stream = serverSocket.GetStream()
+            let state = ref (TransportState.create "SSH-2.0-regression")
+            let events = [ "first"; "second"; "third" ]
+            let server = async {
+                let received = ResizeArray<byte>(payload.Length)
+                let mutable replenished = 0
+                let mutable sentEvents = 0
+                let mutable packets = 0
+                let eventBytes = events |> List.sumBy (fun e -> e.Length)
+                while received.Count < payload.Length || replenished < eventBytes do
+                    match! serverRead stream state with
+                    | ChannelData(7u, bytes) ->
+                        received.AddRange bytes
+                        packets <- packets + 1
+                        // Interleave output early in the transfer; the sender
+                        // must retain it and return its credit.
+                        if packets % 5 = 0 && sentEvents < events.Length then
+                            do! serverSend stream state (ChannelData(0u, Encoding.UTF8.GetBytes events.[sentEvents]))
+                            sentEvents <- sentEvents + 1
+                        // Credit is granted only as the peer consumes data.
+                        do! serverSend stream state (ChannelWindowAdjust(0u, uint32 bytes.Length))
+                    | ChannelWindowAdjust(7u, bytes) -> replenished <- replenished + int bytes
+                    | other -> failwithf "Unexpected client message: %A" other
+                Assert.Equal(eventBytes, replenished)
+                Assert.True((payload = received.ToArray()), "payload arrived out of order or altered")
+            }
+            let clientWork = async {
+                // Write everything before reading anything, as a git push does.
+                match! Client.sendData client 0u payload with
+                | Ok () -> ()
+                | Error e -> failwithf "Client send failed: %A" e
+            }
+            do! Async.Parallel [ server; clientWork ] |> Async.Ignore
+            let stdout = ResizeArray<uint32 * string>()
+            let stderr = ResizeArray<uint32 * string>()
+            let exits = ResizeArray<uint32 * uint32>()
+            let closes = ResizeArray<uint32>()
+            for _ in events do
+                match! Client.receiveOne client (callbacks stdout stderr exits closes) with
+                | Ok true -> ()
+                | other -> failwithf "Client receive failed: %A" other
+            Assert.Equal<string list>(events, stdout |> Seq.map snd |> List.ofSeq)
+        finally
+            client.TcpClient.Dispose()
+    }, timeout = 30000)
