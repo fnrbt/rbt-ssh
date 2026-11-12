@@ -358,3 +358,35 @@ let ``send larger than the peer window completes when nothing else reads`` () =
         finally
             client.TcpClient.Dispose()
     }, timeout = 30000)
+
+[<Fact>]
+let ``send to a peer advertising a larger max packet than ours stays within our packet limit`` () =
+    run (async {
+        let! client, serverSocket = pair ()
+        use serverSocket = serverSocket
+        try
+            // GitHub advertises a maximum packet well above Constants.MaxSendPacketLength.
+            Channel.ChannelManager.updateChannel (!client.Context).ChannelManager 0u
+                (fun channel -> { channel with RemoteWindowSize = 16u * 1024u * 1024u; RemoteMaxPacketSize = 1024u * 1024u }) |> ignore
+            let payload = Array.init (300 * 1024) (fun i -> byte (i * 7 + i / 1000))
+            let stream = serverSocket.GetStream()
+            let state = ref (TransportState.create "SSH-2.0-regression")
+            let server = async {
+                let received = ResizeArray<byte>(payload.Length)
+                while received.Count < payload.Length do
+                    match! serverRead stream state with
+                    | ChannelData(7u, bytes) ->
+                        Assert.True(bytes.Length <= int Constants.DefaultMaxPacketSize)
+                        received.AddRange bytes
+                    | other -> failwithf "Unexpected client message: %A" other
+                Assert.True((payload = received.ToArray()), "payload arrived out of order or altered")
+            }
+            let clientWork = async {
+                match! Client.sendData client 0u payload with
+                | Ok () -> ()
+                | Error e -> failwithf "Client send failed: %A" e
+            }
+            do! Async.Parallel [ server; clientWork ] |> Async.Ignore
+        finally
+            client.TcpClient.Dispose()
+    })

@@ -148,7 +148,7 @@ module Transport =
     }
 
     let private validPacketLength blockSize length =
-        length <= Constants.MaxPacketSize
+        length <= Constants.MaxReceivePacketLength
         && length >= uint32 (max 16 blockSize - 4)
         && (uint64 length + 4UL) % uint64 blockSize = 0UL
 

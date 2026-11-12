@@ -126,7 +126,7 @@ module Packet =
                 paddingLength
 
         let packetLength = baseSize + int64 (paddingLength - minPadding) - 4L
-        if paddingLength > 255 || packetLength > int64 Constants.MaxPacketSize then
+        if paddingLength > 255 || packetLength > int64 Constants.MaxSendPacketLength then
             invalidArg "payload" "SSH packet exceeds permitted padding or packet length"
         let padding = Crypto.randomBytes paddingLength
 

@@ -371,8 +371,16 @@ module Constants =
     let DefaultMaxPacketSize = 32768u  // 32 KB
     [<Literal>]
     let MinPacketSize = 16u
+    /// Largest packet_length accepted from a peer. RFC 4253 §6.1 only requires
+    /// 35000, but a peer may send more than we advertised; OpenSSH accepts up to
+    /// its PACKET_MAX_SIZE of 256 KB, and so do we.
     [<Literal>]
-    let MaxPacketSize = 35000u
+    let MaxReceivePacketLength = 262144u
+    /// Largest packet_length we build: the RFC 4253 §6.1 size every peer must
+    /// accept. A DefaultMaxPacketSize channel chunk plus its headers and
+    /// padding fits well within it.
+    [<Literal>]
+    let MaxSendPacketLength = 35000u
     [<Literal>]
     let BlockSize = 16  // AES block size
     [<Literal>]

@@ -48,7 +48,7 @@ let ``Known messages reject missing and trailing fields`` () =
 let ``Packet builder rejects empty oversized and invalid block framing`` () =
     assertMalformed (fun () -> Packet.buildPacket [||] 8 |> ignore)
     assertMalformed (fun () -> Packet.buildPacket [| 21uy |] 0 |> ignore)
-    assertMalformed (fun () -> Packet.buildPacket (Array.zeroCreate<byte> (int Constants.MaxPacketSize)) 8 |> ignore)
+    assertMalformed (fun () -> Packet.buildPacket (Array.zeroCreate<byte> (int Constants.MaxSendPacketLength)) 8 |> ignore)
     for blockSize in [ 8; Constants.BlockSize ] do
         let packet = Packet.buildPacket [| MessageTypes.SSH_MSG_NEWKEYS |] blockSize
         let length = Packet.readUint32 packet 0
@@ -95,7 +95,7 @@ let private rawPacket padding (payload: byte[]) =
 let ``Outbound invalid payload returns a structured error`` () =
     withStreams (fun writeStream _ _ ->
         let state = TransportState.create "SSH-2.0-tests"
-        for payload in [ [||]; Array.zeroCreate<byte> (int Constants.MaxPacketSize) ] do
+        for payload in [ [||]; Array.zeroCreate<byte> (int Constants.MaxSendPacketLength) ] do
             match Transport.writePacket writeStream state payload |> Async.RunSynchronously with
             | Error (ProtocolError _) -> ()
             | other -> failwithf "Expected outbound protocol error: %A" other)
@@ -103,7 +103,7 @@ let ``Outbound invalid payload returns a structured error`` () =
 [<Fact>]
 let ``Unencrypted framing validates size alignment padding and EOF`` () =
     let state = TransportState.create "SSH-2.0-tests"
-    for length in [ 0u; 7u; 8u; 11u; 13u; 16u; Constants.MaxPacketSize + 1u; UInt32.MaxValue ] do
+    for length in [ 0u; 7u; 8u; 11u; 13u; 16u; Constants.MaxReceivePacketLength + 1u; UInt32.MaxValue ] do
         assertWireError (Packet.writeUint32 length) state
     assertWireError [| 0uy; 0uy |] state
     let valid = rawPacket 10 [| MessageTypes.SSH_MSG_NEWKEYS |] // 16 bytes aligned
@@ -120,6 +120,25 @@ let ``Unencrypted framing validates size alignment padding and EOF`` () =
     | other -> failwithf "Expected valid unencrypted roundtrip: %A" other
     let malformed = Packet.buildPacket [| MessageTypes.SSH_MSG_NEWKEYS; 0uy |] 8
     assertWireError malformed state
+
+[<Fact>]
+let ``Inbound packets may exceed the RFC minimum and a full channel chunk builds outbound`` () =
+    // A peer may send channel data larger than the 32 KB we advertise and the
+    // 35000-byte RFC minimum; the receive cap is OpenSSH's 256 KB.
+    let state = TransportState.create "SSH-2.0-tests"
+    let data = Array.init 100000 byte
+    let payload = Packet.buildMessagePayload (ChannelData(0u, data))
+    let padding = 8 - ((5 + payload.Length) % 8) + 8
+    match receiveWire (rawPacket padding payload) state with
+    | Ok (ChannelData(0u, received), _, _) -> Assert.Equal<byte>(data, received)
+    | other -> failwithf "Large inbound packet was not accepted: %A" other
+    // Outbound: a DefaultMaxPacketSize chunk with the largest channel header
+    // (extended data) builds at every block size and stays within the RFC size.
+    let chunk = Array.zeroCreate<byte> (int Constants.DefaultMaxPacketSize)
+    let extended = Packet.buildMessagePayload (ChannelExtendedData(0u, 1u, chunk))
+    for blockSize in [ 8; Constants.BlockSize ] do
+        let packet = Packet.buildPacket extended blockSize
+        Assert.True(Packet.readUint32 packet 0 <= Constants.MaxSendPacketLength)
 
 let private keys = {
     ClientToServerIV = Array.init Constants.IvLength byte
@@ -138,7 +157,7 @@ let private encryptWire plain =
 
 [<Fact>]
 let ``Encrypted framing rejects malformed lengths padding and incomplete MAC`` () =
-    for length in [ 0u; 11u; 13u; 17u; Constants.MaxPacketSize + 1u; UInt32.MaxValue ] do
+    for length in [ 0u; 11u; 13u; 17u; Constants.MaxReceivePacketLength + 1u; UInt32.MaxValue ] do
         let firstBlock = Array.zeroCreate<byte> Constants.BlockSize
         Array.Copy(Packet.writeUint32 length, firstBlock, 4)
         let encrypted = Crypto.aes256CtrEncrypt keys.ClientToServerEncryptionKey keys.ClientToServerIV firstBlock

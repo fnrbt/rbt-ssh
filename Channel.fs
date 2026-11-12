@@ -75,7 +75,8 @@ module Channel =
         /// reservation is not taken, so the caller must not send anything.
         | Waiting of signal: System.Threading.Tasks.TaskCompletionSource<unit>
 
-    /// Reserve up to one packet of outbound credit, or report the signal that
+    /// Reserve up to one packet of outbound credit (at most the smaller of the
+    /// peer's and our own maximum packet size), or report the signal that
     /// announces the next CHANNEL_WINDOW_ADJUST. Checking the window and
     /// capturing the signal happen under one lock hold, so an adjustment that
     /// lands between the two can never be missed. Only the granted segment
@@ -92,7 +93,11 @@ module Channel =
             | true, _ when offset < 0 || offset >= data.Length ->
                 Error (ChannelError "Outbound data offset is outside the buffer")
             | true, channel ->
-                let packetLimit = min (uint32 (data.Length - offset)) channel.RemoteMaxPacketSize
+                // The peer may accept larger packets than we build (GitHub
+                // advertises more than Constants.MaxSendPacketLength), so a
+                // chunk is also capped at our own maximum channel payload.
+                let packetLimit =
+                    min (uint32 (data.Length - offset)) (min channel.RemoteMaxPacketSize Constants.DefaultMaxPacketSize)
                 if channel.RemoteWindowSize = 0u || packetLimit = 0u then
                     Ok (Waiting channel.WindowSignal)
                 else
@@ -233,9 +238,10 @@ module Channel =
         lock manager.Sync (fun () ->
             match manager.Channels.TryGetValue recipientChannel with
             | false, _ -> Error (ChannelError $"Unknown channel: {recipientChannel}")
-            | true, channel when length < 0 || uint64 length > uint64 channel.LocalWindowSize ||
-                                 uint64 length > uint64 channel.LocalMaxPacketSize ->
-                Error (ProtocolError "Channel data exceeds receive window or maximum packet size")
+            // A peer may send more than our advertised maximum packet (OpenSSH
+            // accepts it too); the transport bounds packets, the window bounds data.
+            | true, channel when length < 0 || uint64 length > uint64 channel.LocalWindowSize ->
+                Error (ProtocolError "Channel data exceeds receive window")
             | true, channel ->
                 manager.Channels.[recipientChannel] <- { channel with LocalWindowSize = channel.LocalWindowSize - uint32 length }
                 Ok channel)

@@ -31,10 +31,12 @@ let ``ordinary and extended input share bounded receive credit`` () =
     Assert.Equal(0u, (Channel.ChannelManager.getChannel manager id).Value.LocalWindowSize)
     Assert.True(Channel.handleChannelExtendedData manager callbacks id 1u [| 6uy |] |> Async.RunSynchronously |> Result.isError)
     Assert.Equal(0u, (Channel.ChannelManager.getChannel manager id).Value.LocalWindowSize)
+    // Data above the advertised maximum packet is accepted, as OpenSSH does;
+    // only the window bounds it.
     let manager2, id2 = channel 10u 4u
-    Assert.True(Channel.handleChannelData manager2 callbacks id2 (Array.zeroCreate 5) |> Async.RunSynchronously |> Result.isError)
-    Assert.True(Channel.handleChannelExtendedData manager2 callbacks id2 1u (Array.zeroCreate 5) |> Async.RunSynchronously |> Result.isError)
-    Assert.Equal(10u, (Channel.ChannelManager.getChannel manager2 id2).Value.LocalWindowSize)
+    Assert.True(Channel.handleChannelData manager2 callbacks id2 (Array.zeroCreate 5) |> Async.RunSynchronously |> Result.isOk)
+    Assert.True(Channel.handleChannelExtendedData manager2 callbacks id2 1u (Array.zeroCreate 6) |> Async.RunSynchronously |> Result.isError)
+    Assert.Equal(5u, (Channel.ChannelManager.getChannel manager2 id2).Value.LocalWindowSize)
 
 [<Fact>]
 let ``only one successful shell or exec starts per channel`` () =
